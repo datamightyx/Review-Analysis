@@ -1,0 +1,22 @@
+# secrets — never commit real credentials
+.streamlit/secrets.toml
+review-scoring/.streamlit/secrets.toml
+review-scoring/.env
+.env
+
+# data now lives in Cloudflare R2, not git — see review-scoring/storage/r2_sync.py
+review-scoring/products/
+review-scoring/review_scoring.db
+review-scoring/usage_history.jsonl
+review-scoring/.calibrate_cache.json
+*.db-wal
+*.db-shm
+
+# real business data — keep locally, never commit
+MIGHTY X.xlsx
+MIGHTY X - Returns Analysis.xlsx
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/

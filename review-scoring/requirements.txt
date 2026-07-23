@@ -1,4 +1,5 @@
 anthropic>=0.75
+aiohttp>=3.9
 openpyxl>=3.1
 pdfplumber>=0.11
 PyPDF2>=3.0

@@ -4,6 +4,7 @@ openpyxl>=3.1
 
 # review-scoring page (pages/2_Review_Scoring.py runs review-scoring/app.py in-process)
 anthropic>=0.75
+aiohttp>=3.9
 pdfplumber>=0.11
 PyPDF2>=3.0
 PyYAML>=6.0

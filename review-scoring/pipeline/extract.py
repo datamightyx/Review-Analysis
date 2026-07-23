@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import itertools
 import re
 
 from . import domain as _domain
@@ -120,8 +121,16 @@ async def extract_phrases_async(reviews: list[Review], llm: LLM,
     valid_cats = set(dom.ids())
     extract_system = build_extract_system(dom)
     extract_schema = build_extract_schema(dom)
-    batches = [reviews[start:start + batch_size]
-               for start in range(0, len(reviews), batch_size)]
+    # Never let one batch span two products: the LLM sees a shared prompt of
+    # up to `batch_size` reviews and answers by review_index, so an index
+    # mix-up at a product boundary would attach one product's real quote to
+    # another product's review_id. Chunking within each product's own run
+    # keeps any such mix-up contained to that product.
+    batches = []
+    for _, group_iter in itertools.groupby(reviews, key=lambda r: r.product):
+        group = list(group_iter)
+        batches += [group[start:start + batch_size]
+                    for start in range(0, len(group), batch_size)]
 
     done = 0
 

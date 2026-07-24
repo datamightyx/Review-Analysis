@@ -359,6 +359,24 @@ def merge_blocked(a: str, b: str) -> str | None:
                        or t in _FORGIVABLE_FILLERS for t in ts)
         if _pure_praise(ta) and _pure_praise(tb):
             return "різні рівні похвали"
+        # a KNOWN praise word on one side against a word the tier list has
+        # never seen on the other ("Wraps well" vs "wraps nicely": "well" is
+        # tier 0, "nicely" is not, so tiers_a/tiers_b above don't even see a
+        # conflict) must not slip through for free — only exact tier
+        # membership licenses a praise-word swap, never an unvetted lookalike
+        extra_a, extra_b = sorted(ta - tb), sorted(tb - ta)
+        for x in list(extra_a):
+            for y in extra_b:
+                if difflib.SequenceMatcher(None, x, y).ratio() >= 0.8:
+                    extra_a.remove(x)
+                    extra_b.remove(y)
+                    break
+        unresolved_a = [t for t in extra_a if _praise_tier(t) is None
+                       and t not in _FORGIVABLE_FILLERS]
+        unresolved_b = [t for t in extra_b if _praise_tier(t) is None
+                       and t not in _FORGIVABLE_FILLERS]
+        if (tiers_a and unresolved_b) or (tiers_b and unresolved_a):
+            return "похвальне слово поза визнаним рівнем (потребує підтвердження)"
     return None
 
 

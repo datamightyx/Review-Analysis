@@ -14,6 +14,13 @@ class TestPraiseTiers(unittest.TestCase):
         # "works good" and "works well" are both plain tier
         self.assertIsNone(merge_blocked("works good", "works well"))
 
+    def test_recognized_tier_vs_unlisted_word_blocked(self):
+        # "well" is tier 0; "nicely" isn't in any tier list at all, so the
+        # tier-mismatch check above never even sees a conflict (empty set on
+        # one side) — this must not read as "no rule violated"
+        self.assertIsNotNone(merge_blocked(
+            "Wraps well.", "It is easy to use and wraps nicely."))
+
 
 class TestQualifierFamilies(unittest.TestCase):
     def test_fast_vs_quickly_separate(self):

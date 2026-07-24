@@ -193,6 +193,26 @@ def sync_folder_down(local_folder: Path, root: Path) -> None:
             client.download_file(_bucket, key, str(dest))
 
 
+def delete_folder(local_folder: Path, root: Path) -> None:
+    """Delete every R2 object under this folder's prefix — the counterpart
+    to upload_folder, used when a product line is deleted so it doesn't
+    reappear via sync_folder_down in a later/other session. No-op if R2
+    isn't configured."""
+    client = _get_client()
+    if client is None:
+        return
+    prefix = _key(local_folder, root) + "/"
+    paginator = client.get_paginator("list_objects_v2")
+    keys = [obj["Key"] for page in paginator.paginate(Bucket=_bucket, Prefix=prefix)
+            for obj in page.get("Contents", [])]
+    for i in range(0, len(keys), 1000):  # delete_objects caps at 1000/call
+        batch = keys[i:i + 1000]
+        client.delete_objects(Bucket=_bucket,
+                              Delete={"Objects": [{"Key": k} for k in batch]})
+    with _lock:
+        _synced_prefixes.discard(prefix)
+
+
 def list_remote_lines(products_root: Path, root: Path) -> list[str]:
     """Product-line folder names that exist in R2 — needed so a freshly
     booted (locally empty) container still lists them in the sidebar."""

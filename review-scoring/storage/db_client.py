@@ -320,6 +320,19 @@ def product_db(folder: Path | str) -> DB:
     return open_db(Path(folder) / PRODUCT_DB_NAME)
 
 
+def close_product_db(folder: Path | str) -> None:
+    """Close and evict a product folder's DB connection from the registry.
+    Required before deleting the folder — Windows keeps an open sqlite file
+    locked, and a stale registry entry would hand out a closed connection
+    if a folder with the same name were recreated later in the same
+    process."""
+    key = str((Path(folder) / PRODUCT_DB_NAME).resolve())
+    with _open_lock:
+        db = _open.pop(key, None)
+    if db is not None:
+        db.close()
+
+
 def root_db(root: Path | str) -> DB:
     """The project-root database (cross-product usage history)."""
     return open_db(Path(root) / ROOT_DB_NAME)

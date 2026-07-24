@@ -9,6 +9,7 @@ import dataclasses
 import html
 import json
 import os
+import shutil
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -44,7 +45,8 @@ from pipeline.models import Taxonomy, product_key
 from pipeline.precedents import (GatePrecedents, aggregate_rule_weights,
                                  load_gate_precedents, rebuild_shared_weights)
 from pipeline import domain as domain_mod
-from storage.db_client import product_db, root_db, PRODUCT_DB_NAME, ROOT_DB_NAME
+from storage.db_client import (product_db, root_db, close_product_db,
+                               PRODUCT_DB_NAME, ROOT_DB_NAME)
 from storage import r2_sync
 
 CAT_LABELS = {
@@ -442,6 +444,20 @@ with st.sidebar:
         if st.button("Створити", width="stretch") and new_name.strip():
             (ROOT / "products" / new_name.strip()).mkdir(parents=True, exist_ok=True)
             st.rerun()
+
+    if folder is not None:
+        with st.expander("🗑 Видалити лінійку"):
+            st.warning(f"Незворотно видалить **{folder.name}** — усі PDF, "
+                       "таксономію, Excel і кеш локально та в хмарі (R2).")
+            confirm = st.text_input(
+                "Введіть назву папки для підтвердження",
+                key=f"del_confirm_{folder.name}", placeholder=folder.name)
+            if st.button("Видалити назавжди", type="primary",
+                         width="stretch", disabled=confirm != folder.name):
+                close_product_db(folder)
+                r2_sync.delete_folder(folder, ROOT)
+                shutil.rmtree(folder, ignore_errors=True)
+                st.rerun()
 
     if folder is not None:
         st.divider()

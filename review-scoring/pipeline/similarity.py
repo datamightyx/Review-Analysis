@@ -371,10 +371,14 @@ def merge_blocked(a: str, b: str) -> str | None:
                     extra_a.remove(x)
                     extra_b.remove(y)
                     break
-        unresolved_a = [t for t in extra_a if _praise_tier(t) is None
-                       and t not in _FORGIVABLE_FILLERS]
-        unresolved_b = [t for t in extra_b if _praise_tier(t) is None
-                       and t not in _FORGIVABLE_FILLERS]
+        # NOTE: _FORGIVABLE_FILLERS is NOT excluded here on purpose — that
+        # list ("handy", "nice") only excuses a filler riding along with the
+        # bare "work" idiom (merge_compatible's separate, narrower check);
+        # reusing it here would let "nicely" (stem "nice") ride free as an
+        # unvetted stand-in for "well" in ANY phrase, defeating this rule
+        # for the exact case it exists to catch.
+        unresolved_a = [t for t in extra_a if _praise_tier(t) is None]
+        unresolved_b = [t for t in extra_b if _praise_tier(t) is None]
         if (tiers_a and unresolved_b) or (tiers_b and unresolved_a):
             return "похвальне слово поза визнаним рівнем (потребує підтвердження)"
     return None

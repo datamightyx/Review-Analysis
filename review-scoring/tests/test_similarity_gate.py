@@ -21,6 +21,15 @@ class TestPraiseTiers(unittest.TestCase):
         self.assertIsNotNone(merge_blocked(
             "Wraps well.", "It is easy to use and wraps nicely."))
 
+    def test_recognized_tier_vs_unlisted_word_blocked_bare_phrase(self):
+        # same pair as above but as the SHORT form a canonical's `.text`
+        # actually holds ("Wraps well" / "wraps nicely", no filler words).
+        # "nicely" stems to "nice", which collides with the PRE-EXISTING
+        # _FORGIVABLE_FILLERS set (added for the unrelated "Handy and work"
+        # == "Work well" idiom) — excluding fillers from the unresolved-word
+        # check above silently let this exact pair back through.
+        self.assertIsNotNone(merge_blocked("Wraps well", "wraps nicely"))
+
 
 class TestQualifierFamilies(unittest.TestCase):
     def test_fast_vs_quickly_separate(self):

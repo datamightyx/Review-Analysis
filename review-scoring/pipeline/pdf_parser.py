@@ -177,7 +177,10 @@ def filter_reviews(reviews: list[Review], max_reviews: int | None = None,
     seen: set[tuple] = set()
     unique = []
     for r in reviews:
-        key = (r.author, r.date, r.body[:120])
+        # full body, not a prefix — truncating let two DIFFERENT reviews
+        # sharing an opening sentence (e.g. a templated first line) collide
+        # and silently drop one of them
+        key = (r.author, r.date, r.body)
         if key in seen:
             continue
         seen.add(key)

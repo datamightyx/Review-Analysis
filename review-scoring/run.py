@@ -36,7 +36,7 @@ from pipeline.grouping import (group_phrases, apply_overrides,
                                consolidate_taxonomy, reassign_phrases,
                                consolidate_rows, merge_sibling_rows,
                                reconcile_votes)
-from pipeline.excel_writer import write_workbook
+from pipeline.excel_writer import save_workbook
 from pipeline.similarity import set_synonym_families
 from pipeline.precedents import load_gate_precedents
 from pipeline.llm import LLM, set_max_concurrency
@@ -47,27 +47,6 @@ from storage.db_client import product_db
 ROOT = Path(__file__).parent
 
 
-def save_workbook(tax, products, out_path: Path) -> Path:
-    """write_workbook, but survives the target being open in Excel
-    (PermissionError): falls back to ' (2)', ' (3)', … suffixes."""
-    # enforce one-review-one-vote right before every write, on every path
-    phantom = reconcile_votes(tax)
-    if phantom:
-        print(f"  узгоджено голоси з відгуками: -{phantom} фантомних")
-    candidates = [out_path] + [
-        out_path.with_name(f"{out_path.stem} ({i}){out_path.suffix}")
-        for i in range(2, 10)]
-    for p in candidates:
-        try:
-            write_workbook(tax, products, p)
-            if p != out_path:
-                print(f"  (!) {out_path.name} відкритий в Excel — "
-                      f"записано у {p.name}")
-            return p
-        except PermissionError:
-            continue
-    raise PermissionError(
-        f"Не вдалося записати {out_path} — закрийте файл в Excel")
 
 
 def load_config() -> dict:

@@ -74,6 +74,14 @@ CREATE TABLE IF NOT EXISTS verbatim_votes (
 );
 CREATE INDEX IF NOT EXISTS idx_votes_canonical
     ON verbatim_votes (canonical_id, product);
+CREATE TABLE IF NOT EXISTS quote_sources (
+    canonical_id TEXT NOT NULL REFERENCES canonical_rows(canonical_id)
+                 ON DELETE CASCADE,
+    product      TEXT NOT NULL,
+    quote        TEXT NOT NULL,
+    review_id    TEXT NOT NULL,
+    UNIQUE (canonical_id, product, quote, review_id)
+);
 CREATE TABLE IF NOT EXISTS llm_cache (
     cache_key     TEXT PRIMARY KEY,
     provider      TEXT NOT NULL DEFAULT '',
@@ -146,6 +154,7 @@ class DB:
         dict order, so a load round-trips to the same iteration order
         (Excel tie-breaking stays byte-identical)."""
         vote_rows: list[tuple[str, str, str, str]] = []
+        source_rows: list[tuple[str, str, str, str]] = []
         for cn in tax.canonicals.values():
             products = list(dict.fromkeys(
                 [*cn.votes, *cn.quotes, *cn.review_ids]))
@@ -157,9 +166,14 @@ class DB:
                 quotes = list(dict.fromkeys(cn.quotes.get(product, [])))
                 for rid, quote in zip_longest(ids, quotes, fillvalue=""):
                     vote_rows.append((cn.id, product, rid, quote))
+            for product, smap in cn.quote_sources.items():
+                for quote, rids in smap.items():
+                    for rid in rids:
+                        source_rows.append((cn.id, product, quote, rid))
         with self._lock, self._conn:
             c = self._conn
             c.execute("DELETE FROM verbatim_votes")
+            c.execute("DELETE FROM quote_sources")
             c.execute("DELETE FROM canonical_rows")
             c.execute("DELETE FROM taxonomy_groups")
             c.execute("INSERT OR REPLACE INTO meta VALUES ('next_id', ?)",
@@ -176,6 +190,10 @@ class DB:
                 "INSERT OR IGNORE INTO verbatim_votes "
                 "(canonical_id, product, review_id, quote) VALUES (?, ?, ?, ?)",
                 vote_rows)
+            c.executemany(
+                "INSERT OR IGNORE INTO quote_sources "
+                "(canonical_id, product, quote, review_id) VALUES (?, ?, ?, ?)",
+                source_rows)
         self.checkpoint()
 
     def load_taxonomy(self) -> Taxonomy:
@@ -221,6 +239,16 @@ class DB:
                     "GROUP BY canonical_id, product"):
                 if cid in tax.canonicals:
                     tax.canonicals[cid].votes[product] = n
+            for cid, product, quote, rid in c.execute(
+                    "SELECT canonical_id, product, quote, review_id "
+                    "FROM quote_sources ORDER BY rowid"):
+                cn = tax.canonicals.get(cid)
+                if cn is None:
+                    continue
+                smap = cn.quote_sources.setdefault(product, {})
+                lst = smap.setdefault(quote, [])
+                if rid not in lst:
+                    lst.append(rid)
         return tax
 
     def taxonomy_counts(self) -> tuple[int, int]:
@@ -325,12 +353,15 @@ def close_product_db(folder: Path | str) -> None:
     Required before deleting the folder — Windows keeps an open sqlite file
     locked, and a stale registry entry would hand out a closed connection
     if a folder with the same name were recreated later in the same
-    process."""
+    process. The pop AND the close happen under the SAME `_open_lock` hold
+    (not released in between) so another thread's open_db() for this same
+    path — which also needs `_open_lock` — cannot race in and reopen the
+    file while it's being closed for deletion."""
     key = str((Path(folder) / PRODUCT_DB_NAME).resolve())
     with _open_lock:
         db = _open.pop(key, None)
-    if db is not None:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 def root_db(root: Path | str) -> DB:

@@ -21,8 +21,13 @@ def product_key(stem: str) -> str:
         B0FB86T1PJ_ppositive                           -> B0FB86T1PJ
         B0D4PHX83N_positive +negative                  -> B0D4PHX83N
     A stem with no sentiment suffix (a normal product name) is returned as-is.
+    Anchored to strip only a TRAILING run of sentiment tokens — a bare
+    leftmost match with `.*$` would also eat a legitimate product name that
+    happens to contain "positive"/"negative" earlier, e.g.
+    "Feel_Positive_Vibes_positive" collapsing to just "Feel".
     """
-    key = re.sub(r"[ _]+\+?[ _]*(?:pp?ositive|negative)\b.*$", "", stem, flags=re.I)
+    key = re.sub(r"(?:[ _]+\+?[ _]*(?:pp?ositive|negative)\b)+$", "",
+                 stem, flags=re.I)
     return key.strip() or stem
 
 
@@ -57,13 +62,20 @@ class Canonical:
     votes: dict[str, int] = field(default_factory=dict)   # product -> count
     quotes: dict[str, list[str]] = field(default_factory=dict)  # product -> raw variants
     review_ids: dict[str, list[str]] = field(default_factory=dict)  # product -> source review ids
+    # product -> {raw quote: [review ids that actually said that quote]}.
+    # `quotes`/`review_ids` above are each deduped independently (a display
+    # sample and a vote-counting set) so their list positions never line up
+    # with each other — this is the ONLY structure that can answer "which
+    # review said THIS exact quote", needed by dual_place overrides.
+    quote_sources: dict[str, dict[str, list[str]]] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
         return sum(self.votes.values())
 
     def add(self, product: str, count: int, raw: str,
-            review_ids: list[str] | None = None) -> None:
+            review_ids: list[str] | None = None,
+            sources: list[tuple[str, str]] | None = None) -> None:
         self.votes[product] = self.votes.get(product, 0) + count
         self.quotes.setdefault(product, [])
         if raw not in self.quotes[product]:
@@ -73,6 +85,14 @@ class Canonical:
             for rid in review_ids:
                 if rid not in ids:
                     ids.append(rid)
+        if sources:  # [(review_id, quote), ...] — real per-review pairs
+            smap = self.quote_sources.setdefault(product, {})
+            for rid, q in sources:
+                if not rid or not q:
+                    continue
+                lst = smap.setdefault(q, [])
+                if rid not in lst:
+                    lst.append(rid)
 
 
 @dataclass
@@ -120,10 +140,12 @@ class Taxonomy:
         positive & negative PDFs into a single column."""
         renamed = 0
         for c in self.canonicals.values():
-            prods = set(c.votes) | set(c.quotes) | set(c.review_ids)
+            prods = (set(c.votes) | set(c.quotes) | set(c.review_ids)
+                     | set(c.quote_sources))
             v: dict[str, int] = {}
             q: dict[str, list[str]] = {}
             r: dict[str, list[str]] = {}
+            s: dict[str, dict[str, list[str]]] = {}
             for p in prods:
                 k = key_fn(p)
                 if k != p:
@@ -136,9 +158,15 @@ class Taxonomy:
                     q.setdefault(k, [])
                     if quote not in q[k]:
                         q[k].append(quote)
+                for quote, rids in c.quote_sources.get(p, {}).items():
+                    smap = s.setdefault(k, {})
+                    lst = smap.setdefault(quote, [])
+                    for rid in rids:
+                        if rid not in lst:
+                            lst.append(rid)
                 if p in c.votes:
                     v[k] = v.get(k, 0) + c.votes[p]
-            c.votes, c.quotes, c.review_ids = v, q, r
+            c.votes, c.quotes, c.review_ids, c.quote_sources = v, q, r, s
         return renamed
 
     # persistence lives in storage/db_client.py (SQLite); the legacy

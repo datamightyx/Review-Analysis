@@ -56,6 +56,22 @@ class TestDedupeOverlapping(unittest.TestCase):
         ])
         self.assertEqual(len(res), 2)
 
+    def test_split_off_tail_is_rechecked_against_a_third_phrase(self):
+        # The long phrase splits into a prefix ("...camping trips and
+        # hiking") plus a distinct tail ("perfect for the beach and pool").
+        # A third phrase ("the beach and pool") is a strict SUBSET of that
+        # split-off tail — it must absorb/drop the (now redundant) tail, or
+        # both survive and double-count this one review.
+        out, log = run([
+            "Great for camping trips and hiking, plus perfect for the beach and pool",
+            "Great for camping trips and hiking",
+            "the beach and pool",
+        ])
+        self.assertEqual(len(out), 2)
+        self.assertIn("Great for camping trips and hiking", out)
+        self.assertIn("the beach and pool", out)
+        self.assertNotIn("perfect for the beach and pool", out)
+
 
 if __name__ == "__main__":
     unittest.main()

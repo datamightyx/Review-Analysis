@@ -264,6 +264,11 @@ def _unique_phrases(phrases: list[ExtractedPhrase]):
             "counts": defaultdict(int),
             "raws": defaultdict(list),
             "review_ids": defaultdict(list),
+            # (review_id, quote) pairs exactly as extracted — the only place
+            # the true per-review pairing survives; raws/review_ids above
+            # are each deduped independently and lose it (see Canonical.
+            # quote_sources docstring in models.py)
+            "pairs": defaultdict(list),
             "relation": p.relation,
             "gist": p.gist,
         })
@@ -272,6 +277,8 @@ def _unique_phrases(phrases: list[ExtractedPhrase]):
             b["raws"][p.product].append(p.quote)
         if p.review_id and p.review_id not in b["review_ids"][p.product]:
             b["review_ids"][p.product].append(p.review_id)
+        if p.review_id and p.quote:
+            b["pairs"][p.product].append((p.review_id, p.quote))
     result = list(buckets.values())
     result.sort(key=lambda b: -sum(b["counts"].values()))
     return result
@@ -340,7 +347,7 @@ def _exact_map(tax: Taxonomy, category: str) -> dict[str, list]:
 def _add_unique(canon, b: dict) -> None:
     for product, count in b["counts"].items():
         canon.add(product, count, "; ".join(b["raws"][product][:3]),
-                  b["review_ids"].get(product))
+                  b["review_ids"].get(product), b.get("pairs", {}).get(product))
 
 
 def _deterministic_prepass(tax: Taxonomy, category: str, uniques: list[dict],
@@ -703,6 +710,7 @@ def _merge_canonical_into(tax: Taxonomy, keep, other) -> None:
             if q not in keep.quotes[product]:
                 keep.quotes[product].append(q)
     _merge_review_ids(keep, other)
+    _merge_quote_sources(keep, other)
     # one review = one vote: a review present in BOTH canonicals was just
     # summed above but deduped in review_ids — re-derive the count from the
     # distinct ids so the shared review is not counted twice
@@ -718,6 +726,16 @@ def _merge_review_ids(keep, other) -> None:
         for rid in ids:
             if rid not in dst:
                 dst.append(rid)
+
+
+def _merge_quote_sources(keep, other) -> None:
+    for product, smap in other.quote_sources.items():
+        dst = keep.quote_sources.setdefault(product, {})
+        for quote, rids in smap.items():
+            lst = dst.setdefault(quote, [])
+            for rid in rids:
+                if rid not in lst:
+                    lst.append(rid)
 
 
 def _dedupe_canonical_into(tax: Taxonomy, keep, other) -> None:
@@ -736,6 +754,7 @@ def _dedupe_canonical_into(tax: Taxonomy, keep, other) -> None:
             if q not in keep.quotes[product]:
                 keep.quotes[product].append(q)
     _merge_review_ids(keep, other)
+    _merge_quote_sources(keep, other)
     del tax.canonicals[other.id]
 
 
@@ -1385,7 +1404,8 @@ def _apply_assignment(tax: Taxonomy, category: str, b: dict, a: dict,
 
     for product, count in b["counts"].items():
         raw = "; ".join(b["raws"][product][:3])
-        canon.add(product, count, raw, b["review_ids"].get(product))
+        canon.add(product, count, raw, b["review_ids"].get(product),
+                  b.get("pairs", {}).get(product))
 
     # dual placement: duplicate the canonical into the second group
     second_id = (a.get("second_group_id") or "").strip()
@@ -1404,7 +1424,8 @@ def _apply_assignment(tax: Taxonomy, category: str, b: dict, a: dict,
             twin = tax.new_canonical(b["text"], second.id)
         for product, count in b["counts"].items():
             raw = "; ".join(b["raws"][product][:3])
-            twin.add(product, count, raw, b["review_ids"].get(product))
+            twin.add(product, count, raw, b["review_ids"].get(product),
+                     b.get("pairs", {}).get(product))
 
     # dual placement into a specific EXISTING row: a quote naming two benefits
     # that already have their own rows (often in the same group, e.g. "great
@@ -1431,7 +1452,8 @@ def _apply_assignment(tax: Taxonomy, category: str, b: dict, a: dict,
         # (reconcile_votes only reconstructs from ids actually recorded).
         for product, count in b["counts"].items():
             raw = "; ".join(b["raws"][product][:3])
-            dst.add(product, count, raw, b["review_ids"].get(product))
+            dst.add(product, count, raw, b["review_ids"].get(product),
+                   b.get("pairs", {}).get(product))
     return canon
 
 
@@ -1544,15 +1566,17 @@ def apply_overrides(tax: Taxonomy, path: Path) -> None:
             continue
         # resolve the source review from WITHIN the named rows, so an
         # identical quote elsewhere (e.g. the same words in another category)
-        # can never be picked by mistake
+        # can never be picked by mistake. Uses quote_sources — the only
+        # structure that actually pairs a quote with ITS review — instead of
+        # index-matching quotes[]/review_ids[], which are deduped
+        # independently and can differ in length (see models.py Canonical).
         want = normalize(quote)
         src = None  # (product, review_id)
         for c in targets:
-            for product, qs in c.quotes.items():
-                ids = c.review_ids.get(product, [])
-                for i, q in enumerate(qs):
-                    if normalize(q) == want or want in normalize(q):
-                        src = (product, ids[i] if i < len(ids) else None)
+            for product, smap in c.quote_sources.items():
+                for q, rids in smap.items():
+                    if rids and (normalize(q) == want or want in normalize(q)):
+                        src = (product, rids[0])
                         break
                 if src:
                     break
@@ -1564,4 +1588,4 @@ def apply_overrides(tax: Taxonomy, path: Path) -> None:
         for c in targets:
             if rid in c.review_ids.get(product, []):
                 continue    # already counted here — don't double-add
-            c.add(product, 1, quote, [rid])
+            c.add(product, 1, quote, [rid], [(rid, quote)])

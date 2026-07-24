@@ -231,3 +231,23 @@ def write_workbook(tax: Taxonomy, products: dict[str, str],
     _set_widths(ws, [19.75, 88.5])
 
     wb.save(out_path)
+
+
+def save_workbook(tax: Taxonomy, products: dict[str, str],
+                  out_path: Path) -> Path:
+    """write_workbook, but survives the target being open in Excel
+    (PermissionError): falls back to ' (2)', ' (3)', … suffixes. Returns the
+    path actually written — callers must use it, not out_path, since it may
+    differ. Shared by run.py (CLI) and app.py (Streamlit) so both survive a
+    locked file the same way."""
+    candidates = [out_path] + [
+        out_path.with_name(f"{out_path.stem} ({i}){out_path.suffix}")
+        for i in range(2, 10)]
+    for p in candidates:
+        try:
+            write_workbook(tax, products, p)
+            return p
+        except PermissionError:
+            continue
+    raise PermissionError(
+        f"Не вдалося записати {out_path} — закрийте файл в Excel")

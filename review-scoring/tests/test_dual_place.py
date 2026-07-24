@@ -20,8 +20,14 @@ class TestDualPlaceOverride(unittest.TestCase):
     def test_dual_place_adds_to_second_row_deduped(self):
         tax = self._tax()
         # put the dual quote on the emergencies row
-        canon_by_text(tax, "emergencies row").quotes["A"] = ["great for an emergency or first aid kit"]
-        canon_by_text(tax, "emergencies row").review_ids["A"] = ["A:1"]
+        em = canon_by_text(tax, "emergencies row")
+        em.quotes["A"] = ["great for an emergency or first aid kit"]
+        em.review_ids["A"] = ["A:1"]
+        # dual_place resolves the source review via quote_sources (the real
+        # per-review quote<->id pairing) — production code populates this
+        # through Canonical.add(); this fixture bypasses add() so it must
+        # supply the same mapping directly.
+        em.quote_sources["A"] = {"great for an emergency or first aid kit": ["A:1"]}
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "overrides.json"
             p.write_text(json.dumps({"dual_place": [

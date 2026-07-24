@@ -18,6 +18,7 @@ stays optional for local development.
 """
 from __future__ import annotations
 
+import sys
 import threading
 from pathlib import Path
 
@@ -79,7 +80,13 @@ def _put(local_path: Path, root: Path) -> None:
     client = _get_client()
     if client is None or not local_path.exists():
         return
-    client.upload_file(str(local_path), _bucket, _key(local_path, root))
+    try:
+        client.upload_file(str(local_path), _bucket, _key(local_path, root))
+    except Exception as e:
+        # a transient R2 error shouldn't crash the whole Streamlit rerun —
+        # the local write already succeeded; log so the desync is at least
+        # visible in server logs instead of silently vanishing
+        print(f"[r2_sync] upload failed for {local_path}: {e}", file=sys.stderr)
 
 
 def upload_file(local_path: Path, root: Path) -> int:
@@ -95,7 +102,10 @@ def delete_file(local_path: Path, root: Path) -> None:
     client = _get_client()
     if client is None:
         return
-    client.delete_object(Bucket=_bucket, Key=_key(local_path, root))
+    try:
+        client.delete_object(Bucket=_bucket, Key=_key(local_path, root))
+    except Exception as e:
+        print(f"[r2_sync] delete failed for {local_path}: {e}", file=sys.stderr)
 
 
 def upload_folder(local_folder: Path, root: Path) -> int:
@@ -170,7 +180,11 @@ def sync_file_down(local_path: Path, root: Path) -> None:
 
 def sync_folder_down(local_folder: Path, root: Path) -> None:
     """Pull every object under this folder's R2 prefix into the local
-    (ephemeral) folder — only once per process per folder."""
+    (ephemeral) folder — only once per process per folder. The prefix is
+    marked synced only AFTER the download loop finishes without error: if
+    a transient failure interrupts it partway through, the prefix stays
+    unmarked so a later call in this process retries instead of leaving
+    some files permanently missing locally for the rest of the process."""
     client = _get_client()
     if client is None:
         return
@@ -178,19 +192,25 @@ def sync_folder_down(local_folder: Path, root: Path) -> None:
     with _lock:
         if prefix in _synced_prefixes:
             return
-        _synced_prefixes.add(prefix)
     local_folder.mkdir(parents=True, exist_ok=True)
-    paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=_bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/"):
-                continue
-            dest = root / key
-            if dest.exists() and dest.stat().st_size == obj["Size"]:
-                continue  # already present (warm process, repeated rerun)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            client.download_file(_bucket, key, str(dest))
+    try:
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=_bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/"):
+                    continue
+                dest = root / key
+                if dest.exists() and dest.stat().st_size == obj["Size"]:
+                    continue  # already present (warm process, repeated rerun)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                client.download_file(_bucket, key, str(dest))
+    except Exception as e:
+        print(f"[r2_sync] sync_folder_down failed for {prefix}: {e}",
+              file=sys.stderr)
+        return
+    with _lock:
+        _synced_prefixes.add(prefix)
 
 
 def delete_folder(local_folder: Path, root: Path) -> None:

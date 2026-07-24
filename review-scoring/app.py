@@ -39,7 +39,7 @@ from pipeline.extract import (extract_phrases, validate_verbatim,
 from pipeline.grouping import (group_phrases, apply_overrides, normalize,
                                reassign_phrases, reconcile_votes,
                                consolidate_taxonomy, merge_sibling_rows)
-from pipeline.excel_writer import write_workbook
+from pipeline.excel_writer import save_workbook
 from pipeline.llm import LLM, set_max_concurrency
 from pipeline.models import Taxonomy, product_key
 from pipeline.precedents import (GatePrecedents, aggregate_rule_weights,
@@ -339,7 +339,7 @@ def regenerate_excel(folder: Path) -> Path:
     mapping = load_mapping(folder)
     products = {v["name"]: v.get("link", "") for v in mapping.values()}
     out = folder / f"{folder.name} - {date.today().strftime('%d.%m.%Y')}.xlsx"
-    write_workbook(tax, products, out)
+    out = save_workbook(tax, products, out)
     r2_sync.upload_file(out, ROOT)
     return out
 
@@ -456,7 +456,14 @@ with st.sidebar:
                          width="stretch", disabled=confirm != folder.name):
                 close_product_db(folder)
                 r2_sync.delete_folder(folder, ROOT)
-                shutil.rmtree(folder, ignore_errors=True)
+                try:
+                    shutil.rmtree(folder)
+                except OSError as e:
+                    st.error(
+                        f"Видалено в хмарі (R2), але локальні файли "
+                        f"лишились заблокованими: {e}. Закрийте інші "
+                        "вкладки/сесії цієї лінійки і спробуйте ще раз.")
+                    st.stop()
                 st.rerun()
 
     if folder is not None:
@@ -787,7 +794,7 @@ with tab_run:
                     st.write("**5/5 Excel**")
                     out = folder / (f"{folder.name} - "
                                     f"{date.today().strftime('%d.%m.%Y')}.xlsx")
-                    write_workbook(tax, products, out)
+                    out = save_workbook(tax, products, out)
 
                     status.update(label="Готово ✅", state="complete")
 

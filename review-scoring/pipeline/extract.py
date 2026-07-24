@@ -239,7 +239,7 @@ def dedupe_overlapping(phrases: list[ExtractedPhrase]) -> tuple[
         core; both carry the same review's single vote).
     Returns (new_phrases, {"dropped": [...], "split": [(old,new), ...]}).
     """
-    from collections import defaultdict
+    from collections import defaultdict, deque
     from dataclasses import replace as _dc_replace
     groups: dict[tuple, list[ExtractedPhrase]] = defaultdict(list)
     for p in phrases:
@@ -252,8 +252,14 @@ def dedupe_overlapping(phrases: list[ExtractedPhrase]) -> tuple[
         if len(plist) < 2:
             continue
         toks = {id(p): _words(p.quote) for p in plist}
-        # shorter phrases first so a subset is seen before its superset
-        for B in sorted(plist, key=lambda p: len(toks[id(p)]), reverse=True):
+        # shorter phrases first so a subset is seen before its superset.
+        # A work QUEUE, not a one-shot sorted() snapshot: a split-off tail
+        # appended mid-pass must also get its turn as B, or an overlap
+        # between the tail and a third phrase is never caught (both would
+        # then survive and double-count that review).
+        queue = deque(sorted(plist, key=lambda p: len(toks[id(p)]), reverse=True))
+        while queue:
+            B = queue.popleft()
             if id(B) in remove:
                 continue
             for A in plist:
@@ -270,6 +276,7 @@ def dedupe_overlapping(phrases: list[ExtractedPhrase]) -> tuple[
                     add.append(new)
                     toks[id(new)] = _words(new.quote)
                     plist.append(new)
+                    queue.append(new)
                     log["split"].append((B.quote, new.quote))
                 else:
                     log["dropped"].append(B.quote)
@@ -277,7 +284,12 @@ def dedupe_overlapping(phrases: list[ExtractedPhrase]) -> tuple[
                 break
     if not remove and not add:
         return phrases, log
-    result = [p for p in phrases if id(p) not in remove] + add
+    # `add` must be filtered by `remove` too — a split-off tail (in `add`)
+    # can itself later be found redundant against a third phrase and get
+    # its id added to `remove` (see the work-queue above); without this
+    # filter it would survive in the output regardless.
+    result = ([p for p in phrases if id(p) not in remove] +
+              [p for p in add if id(p) not in remove])
     return result, log
 
 

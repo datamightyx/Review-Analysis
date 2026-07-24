@@ -12,6 +12,9 @@ class TestProductKey(unittest.TestCase):
             "B0FFT5KR8L_negative": "B0FFT5KR8L",
             "B0FB86T1PJ_ppositive": "B0FB86T1PJ",
             "B0D4PHX83N_positive +negative": "B0D4PHX83N",
+            # a legitimate name containing "_positive_" in the MIDDLE plus a
+            # genuine trailing suffix must only lose the trailing one
+            "Feel_Positive_Vibes_positive": "Feel_Positive_Vibes",
         }
         for stem, want in cases.items():
             self.assertEqual(product_key(stem), want, stem)

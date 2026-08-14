@@ -154,6 +154,30 @@ def _parse_json_loose(text: str) -> dict:
         raise
 
 
+def _coerce_result(result, schema: dict):
+    """Force a provider response into the object shape callers expect.
+
+    Every schema here is an object wrapping named arrays, but a model can
+    answer with the bare array instead (most often on the OpenRouter
+    no-schema fallback, where the schema only lives in the prompt — and a
+    model that silently ignores response_format can do it in schema mode
+    too). Callers then call result.get(...) on a list and blow up. If the
+    schema has exactly one array property, the bare array is unambiguously
+    that property's value, so wrap it; anything else raises here, with the
+    payload visible, instead of failing cryptically further down."""
+    if isinstance(result, dict):
+        return result
+    props = schema.get("properties") or {}
+    if isinstance(result, list):
+        arrays = [k for k, v in props.items()
+                  if isinstance(v, dict) and v.get("type") == "array"]
+        if len(arrays) == 1:
+            return {arrays[0]: result}
+    raise RuntimeError(
+        f"Модель повернула {type(result).__name__} замість об'єкта з полями "
+        f"{sorted(props)}: {json.dumps(result, ensure_ascii=False)[:300]}")
+
+
 class LLM:
     def __init__(self, model: str | None = None, cache=None,
                  effort: str = "medium", provider: str = "anthropic"):
@@ -186,7 +210,9 @@ class LLM:
             cached = self.cache.llm_cache_get(key)
             if cached is not None:
                 self.cache_hits += 1
-                return cached
+                # coerce on read too: a malformed shape cached by an older
+                # build would otherwise replay forever
+                return _coerce_result(cached, schema)
 
         async with _res()["sem"]:
             if self.provider == "openrouter":
@@ -196,6 +222,7 @@ class LLM:
                 result = await self._acall_anthropic(system, user, schema,
                                                      max_tokens)
         self.calls += 1
+        result = _coerce_result(result, schema)
 
         if self.cache is not None:
             self.cache.llm_cache_put(key, self.provider, self.model,

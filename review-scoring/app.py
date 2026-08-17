@@ -441,15 +441,59 @@ with st.sidebar:
     if _domain_err:
         st.error(f"Помилка в domain.yaml: {_domain_err}\n\nВикористано "
                  "профіль за замовчуванням.")
-    elif folder is not None and not (folder / "domain.yaml").exists():
-        # not an error, but silently reverting to the wound-care few-shot
-        # examples (domain.default_domain()'s judge_examples) can cost real
-        # grouping quality on an unrelated product line — surface it instead
-        # of letting it stay invisible until someone reads the workbook
-        st.info("domain.yaml відсутній — профіль за замовчуванням "
-                "(косметика першої допомоги). Якщо ця лінійка товарів "
-                "інша — створіть профіль: `python run.py "
-                f"{folder.name} --init-domain`")
+
+    if folder is not None:
+        # GUI create/edit for domain.yaml — Streamlit Cloud has no shell and
+        # products/ lives only in R2 (gitignored locally too), so
+        # `python run.py ... --init-domain` is unreachable there. This is
+        # the same write_default_yaml() the CLI flag calls, just triggered
+        # from a button and pushed to R2 instead of touched by hand on disk.
+        _domain_path = folder / "domain.yaml"
+        _has_domain = _domain_path.exists()
+        _label = ("⚙️ Профіль домену (domain.yaml)" if _has_domain and not _domain_err
+                  else "⚠️ Профіль домену — не налаштовано")
+        with st.expander(_label):
+            if not _has_domain:
+                st.info("Немає власного профілю категорій — пайплайн "
+                        "працює на дефолтному (косметика першої допомоги): "
+                        "чужі категорії, заголовки й приклади для судді "
+                        "групування. Створіть свій — без доступу до "
+                        "файлової системи чи git, прямо тут.")
+                if st.button("Створити профіль за замовчуванням",
+                             key="create_domain", width="stretch"):
+                    domain_mod.write_default_yaml(_domain_path)
+                    r2_sync.upload_file(_domain_path, ROOT)
+                    st.rerun()
+            else:
+                if _domain_err:
+                    st.error(f"Некоректний YAML: {_domain_err}")
+                st.caption(str(_domain_path))
+                current_text = _domain_path.read_text(encoding="utf-8")
+                edited = st.text_area(
+                    "Категорії, аркуші, приклади для судді (judge_examples) "
+                    "— редагуйте прямо тут",
+                    value=current_text, height=320, key="domain_yaml_editor")
+                dcol1, dcol2 = st.columns(2)
+                with dcol1:
+                    if st.button("💾 Зберегти", key="save_domain",
+                                 width="stretch"):
+                        try:
+                            data = yaml.safe_load(edited) or {}
+                            domain_mod.domain_from_dict(data)  # validate
+                        except Exception as e:
+                            st.error(f"Не збережено — некоректний "
+                                     f"domain.yaml: {e}")
+                        else:
+                            _domain_path.write_text(edited, encoding="utf-8")
+                            r2_sync.upload_file(_domain_path, ROOT)
+                            st.success("Збережено.")
+                            st.rerun()
+                with dcol2:
+                    if st.button("↺ Скинути на дефолт", key="reset_domain",
+                                 width="stretch"):
+                        domain_mod.write_default_yaml(_domain_path)
+                        r2_sync.upload_file(_domain_path, ROOT)
+                        st.rerun()
 
     with st.expander("➕ Нова лінійка"):
         new_name = st.text_input("Назва папки", placeholder="styptic")

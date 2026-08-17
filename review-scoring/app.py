@@ -683,11 +683,15 @@ with tab_run:
                                         min_value=0, value=0, step=5,
                                         help="Швидкий тест — напр. 15")
             with c2:
+                st.markdown("<div style='height:1.9em'></div>",
+                           unsafe_allow_html=True)
                 use_cutoff = st.checkbox("Лише відгуки після дати")
                 cutoff = st.date_input("Дата відсічення",
                                        value=date(2025, 1, 1),
                                        disabled=not use_cutoff)
             with c3:
+                st.markdown("<div style='height:1.9em'></div>",
+                           unsafe_allow_html=True)
                 fresh = st.checkbox("🔄 Таксономія з нуля (--fresh)",
                                     help="Інакше нові фрази наповнюють існуючі групи")
 

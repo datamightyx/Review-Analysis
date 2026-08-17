@@ -52,7 +52,12 @@ def read_gold(xlsx: Path, sheet: str) -> list[dict]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("xlsx")
+    ap.add_argument("xlsx", nargs="+",
+                    help="один чи кілька еталонних .xlsx — метрика по кожному "
+                         "плюс агрегат наприкінці. Кілька фікстур ловлять "
+                         "регресію на ОДНОМУ домені, замасковану поліпшенням "
+                         "на іншому (промпт/поріг, підігнаний під один "
+                         "продукт, не мусить тихо ламати інший).")
     ap.add_argument("--sheet", default="Positive")
     ap.add_argument("--per-group", type=int, default=10,
                     help="рядків з кожної еталонної групи (стратифікована вибірка)")
@@ -61,7 +66,45 @@ def main() -> None:
     ap.add_argument("--model", default=None)
     args = ap.parse_args()
 
-    gold_rows = read_gold(Path(args.xlsx), args.sheet)
+    import yaml
+    cfg_path = Path(__file__).parent / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    provider = cfg.get("provider", "anthropic")
+    from pipeline.llm import set_max_concurrency
+    set_max_concurrency(cfg.get("max_concurrent_requests", 10))
+    from storage.db_client import root_db
+    # ONE shared cache across every fixture in this run: identical prompts
+    # (e.g. two fixtures sharing a common phrasing) hit cache for free, and
+    # a rerun after a prompt/threshold tweak only re-bills what changed.
+    cache = root_db(Path(__file__).parent)
+
+    results = []  # (path, prec, rec, f1, n_gold_groups)
+    for xlsx_path in args.xlsx:
+        prec, rec, f1, n_groups = run_one(Path(xlsx_path), args, cfg,
+                                          provider, cache)
+        results.append((xlsx_path, prec, rec, f1, n_groups))
+
+    if len(results) > 1:
+        print("\n" + "=" * 60)
+        print("АГРЕГАТ по всіх фікстурах:")
+        for path, prec, rec, f1, n in results:
+            print(f"  {Path(path).name:40s}  P={prec:.3f}  R={rec:.3f}  "
+                  f"F1={f1:.3f}  ({n} груп)")
+        avg_f1 = sum(r[3] for r in results) / len(results)
+        min_f1 = min(r[3] for r in results)
+        print(f"  {'—' * 40}")
+        print(f"  {'середнє F1':40s}  {avg_f1:.3f}   "
+              f"(мінімум по фікстурах: {min_f1:.3f})")
+        print("  Поріг/промпт, підігнаний під ОДНУ фікстуру, не мусить "
+              "тихо знижувати мінімум по решті.")
+
+
+def run_one(xlsx: Path, args, cfg: dict, provider: str,
+           cache) -> tuple[float, float, float, int]:
+    """Calibrate against ONE reference workbook; returns
+    (precision, recall, F1, n_gold_groups) for the aggregate summary."""
+    print(f"\n{'=' * 60}\n{xlsx.name}\n{'=' * 60}")
+    gold_rows = read_gold(xlsx, args.sheet)
     print(f"Еталон: {len(gold_rows)} рядків, "
           f"{len({r['group'] for r in gold_rows})} груп")
 
@@ -87,14 +130,6 @@ def main() -> None:
                 product=r["product"], review_id=f"gold:{i}",
             ))
 
-    import yaml
-    cfg_path = Path(__file__).parent / "config.yaml"
-    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
-    provider = cfg.get("provider", "anthropic")
-    from pipeline.llm import set_max_concurrency
-    set_max_concurrency(cfg.get("max_concurrent_requests", 10))
-    from storage.db_client import root_db
-    cache = root_db(Path(__file__).parent)
     # mirror run.py's tiered LLM setup (same cache DB, so a rerun and even
     # cross-pass calls with identical prompts hit cache) so this measures the
     # SAME pipeline the user actually runs, not just the first grouping pass.
@@ -228,6 +263,8 @@ def main() -> None:
     total_calls = llm.calls + llm_consolidate.calls + llm_reassign.calls
     total_hits = llm.cache_hits + llm_consolidate.cache_hits + llm_reassign.cache_hits
     print(f"\nLLM: {total_calls} викликів, {total_hits} з кешу")
+
+    return prec, rec, f1, len({g for _, g, *_ in items})
 
 
 if __name__ == "__main__":

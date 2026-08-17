@@ -54,6 +54,11 @@ _EXTRACT_FOOTER = """\
 5. One phrase may legitimately carry two categories at once — if so, give it
    both.
 6. If a review has nothing useful, return an empty phrase list for it.
+7. TRANSLATION for non-English quotes. If the quote you extracted is NOT in
+   English, ALSO fill quote_en with a literal English translation of it —
+   used only internally to match it against English-language rows in the
+   taxonomy, never shown to a customer. Leave quote_en empty when the quote
+   is already English.
 """
 
 
@@ -83,6 +88,7 @@ def build_extract_schema(dom: _domain.Domain | None = None) -> dict:
                                 "type": "object",
                                 "properties": {
                                     "quote": {"type": "string"},
+                                    "quote_en": {"type": "string"},
                                     "categories": {
                                         "type": "array",
                                         "items": {"type": "string",
@@ -172,6 +178,7 @@ async def extract_phrases_async(reviews: list[Review], llm: LLM,
                         review_id=r.review_id,
                         relation=(p.get("relation") or "").strip(),
                         gist=(p.get("gist") or "").strip(),
+                        quote_en=(p.get("quote_en") or "").strip(),
                     ))
     return phrases
 

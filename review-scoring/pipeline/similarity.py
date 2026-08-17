@@ -195,6 +195,94 @@ def set_synonym_families(families) -> None:
     _SYN_LOOKUP = {s: i for i, f in enumerate(_SYN_FAMILIES) for s in f}
 
 
+# Attribute families for the POLARITY check: a product line may declare a
+# tracked attribute ("scent", "dust", "clump") in config.yaml
+# (attribute_families). Two phrases that both mention the SAME family but
+# with OPPOSITE polarity (one asserts it, the other denies it) are never the
+# same row and never the same group — "unscented" and "smells amazing" both
+# concern scent, but state opposite claims. Empty by default (universal-tool
+# rule: no domain vocabulary baked into code), same pattern as
+# _SYN_FAMILIES/set_synonym_families above.
+_ATTR_FAMILIES: tuple[frozenset[str], ...] = ()
+
+_POLARITY_PREFIXES = ("un", "non", "dis")
+_POLARITY_SUFFIXES = {"free", "less"}
+
+
+def set_attribute_families(families) -> None:
+    """Install per-run polarity-tracked attribute families (config.yaml:
+    attribute_families, e.g. [[scent, smell, odor, fragrance, aroma],
+    [dust, dusty], [clump, clumping]]). families=None/[] clears them — the
+    polarity check is then a no-op."""
+    global _ATTR_FAMILIES
+    fams = []
+    for fam in families or ():
+        words = [w for w in fam if isinstance(w, str) and w.strip()]
+        if words:
+            fams.append(_stems(words))
+    _ATTR_FAMILIES = tuple(fams)
+
+
+def _polarity_negated(tokens: set[str]) -> bool:
+    """Whole-phrase negation signal beyond bare `not/no/never` tokens: a
+    free/less suffix ("dust free" -> tokens "dust","free") or an un-/non-/
+    dis- prefix ("unscented"). Biased to under-detect rather than
+    over-detect (a missed negation just means "ask the judge instead of
+    auto-veto", never a wrong merge) — a short remainder after stripping the
+    prefix is required so "under"/"disk"-style false positives stay rare.
+    Takes RAW (unfiltered) tokens — "not" is itself in _STOPWORDS, so a
+    caller that already dropped stopwords would never see it here."""
+    if tokens & _NEGATIONS:
+        return True
+    for t in tokens:
+        if t in _POLARITY_SUFFIXES:
+            return True
+        for p in _POLARITY_PREFIXES:
+            if t.startswith(p) and len(t) - len(p) >= 4:
+                return True
+    return False
+
+
+def _strip_polarity_affix(t: str) -> str:
+    """Peel a recognized un-/non-/dis- prefix or free/less suffix off a
+    token so the CORE attribute word remains for family matching —
+    "unscented" -> "scented" (then _stem strips "-ed" -> "scent", same stem
+    as the family word "scent"). Without this, _stem (suffix-only) leaves
+    "unscented" as "unscent", which never equals "scent" and the family
+    check silently never fires for prefix-negated words."""
+    for p in _POLARITY_PREFIXES:
+        if t.startswith(p) and len(t) - len(p) >= 4:
+            return t[len(p):]
+    if t in _POLARITY_SUFFIXES:
+        return ""   # "free"/"less" alone carries no attribute content
+    return t
+
+
+def polarity_conflict(a: str, b: str) -> bool:
+    """True when `a` and `b` make OPPOSITE claims about the same tracked
+    attribute family (config.yaml: attribute_families) — one side asserts
+    the attribute, the other denies it ("not dusty" vs "very dusty",
+    "unscented" vs "a pleasant floral scent"). No-op (always False) when no
+    families are configured. Used to veto auto-merges/judge merges and to
+    flag same-group rows for the split pass — this never FORCES a split by
+    itself, only marks the pair as a hard veto and a must-review signal."""
+    if not _ATTR_FAMILIES:
+        return False
+    pa, pb = _prepare(a), _prepare(b)
+    ta, tb = set(pa.split()), set(pb.split())
+    if not ta or not tb:
+        return False
+    # negation check runs on the RAW token set (stopwords included — "not"
+    # is itself a stopword); family matching runs on the affix-stripped,
+    # stopword-filtered, stemmed set
+    neg_a, neg_b = _polarity_negated(ta), _polarity_negated(tb)
+    if neg_a == neg_b:
+        return False
+    sa = {_stem(_strip_polarity_affix(t)) for t in ta if t not in _STOPWORDS}
+    sb = {_stem(_strip_polarity_affix(t)) for t in tb if t not in _STOPWORDS}
+    return any(sa & fam and sb & fam for fam in _ATTR_FAMILIES)
+
+
 def _neg_collapse(stems: set[str]) -> set[str]:
     """Both-negated comparison form: drop negation/degree/praise residue,
     fold synonym-family members into one marker."""
@@ -324,6 +412,8 @@ def merge_blocked(a: str, b: str) -> str | None:
     "essential part of my emergency kit"). Blocking judge merges on
     anything less than a hard rule causes the row fragmentation the user
     reported (30 sibling rows saying "doesn't stick")."""
+    if polarity_conflict(a, b):
+        return "протилежна полярність атрибута (config: attribute_families)"
     if merge_compatible(a, b):
         return None
     pa, pb = _prepare(a), _prepare(b)
@@ -406,7 +496,8 @@ def auto_merge_target(text: str, items: list[tuple[str, str]]
             continue
         s = similarity(text, ctext)
         strong = ta == tb or (_has_work(ta) and _has_work(tb)) or s >= 0.5
-        if not strong or not merge_compatible(text, ctext):
+        if not strong or polarity_conflict(text, ctext) \
+                or not merge_compatible(text, ctext):
             continue
         if s > best_score:
             best, best_score = (cid, ctext), s

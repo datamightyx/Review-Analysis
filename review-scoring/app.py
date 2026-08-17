@@ -38,8 +38,10 @@ from pipeline.extract import (extract_phrases, validate_verbatim,
                               dedupe_overlapping)
 from pipeline.grouping import (group_phrases, apply_overrides, normalize,
                                reassign_phrases, reconcile_votes,
-                               consolidate_taxonomy, merge_sibling_rows)
+                               consolidate_taxonomy, merge_sibling_rows,
+                               split_groups)
 from pipeline.excel_writer import save_workbook
+from pipeline.quality import workbook_warnings
 from pipeline.llm import LLM, set_max_concurrency
 from pipeline.models import Taxonomy, product_key
 from pipeline.precedents import (GatePrecedents, aggregate_rule_weights,
@@ -411,8 +413,9 @@ cfg = load_config()
 set_max_concurrency(cfg.get("max_concurrent_requests", 10))
 # optional deterministic synonym families from config.yaml — must be
 # installed before any grouping/row-merge pass
-from pipeline.similarity import set_synonym_families
+from pipeline.similarity import set_synonym_families, set_attribute_families
 set_synonym_families(cfg.get("synonym_families"))
+set_attribute_families(cfg.get("attribute_families"))
 
 with st.sidebar:
     st.title("📊 Review Scoring")
@@ -438,6 +441,15 @@ with st.sidebar:
     if _domain_err:
         st.error(f"Помилка в domain.yaml: {_domain_err}\n\nВикористано "
                  "профіль за замовчуванням.")
+    elif folder is not None and not (folder / "domain.yaml").exists():
+        # not an error, but silently reverting to the wound-care few-shot
+        # examples (domain.default_domain()'s judge_examples) can cost real
+        # grouping quality on an unrelated product line — surface it instead
+        # of letting it stay invisible until someone reads the workbook
+        st.info("domain.yaml відсутній — профіль за замовчуванням "
+                "(косметика першої допомоги). Якщо ця лінійка товарів "
+                "інша — створіть профіль: `python run.py "
+                f"{folder.name} --init-domain`")
 
     with st.expander("➕ Нова лінійка"):
         new_name = st.text_input("Назва папки", placeholder="styptic")
@@ -746,6 +758,16 @@ with tab_run:
                         audit.extend({"type": "consolidate", "category": "",
                                       "action": a} for a in actions)
 
+                    if cfg.get("split", True):
+                        st.write("　розбиття мегагруп…")
+                        s_actions = split_groups(
+                            tax, llm_consolidate,
+                            min_share=cfg.get("split_min_share", 0.12),
+                            min_rows=cfg.get("split_min_rows", 25),
+                            audit=audit)
+                        for a in s_actions:
+                            st.write(f"　· {a}")
+
                     # 4. reassignment against the final taxonomy
                     if cfg.get("reassign", True):
                         st.write("**4/5 Перепризначення** (фінальна таксономія)")
@@ -789,6 +811,14 @@ with tab_run:
                     if audit:
                         st.info(f"🕵 Місць для перевірки: {len(audit)} — "
                                 f"вкладка «Перевірити»")
+
+                    qwarnings = workbook_warnings(tax)
+                    if qwarnings:
+                        (folder / "quality_warnings.json").write_text(
+                            json.dumps(qwarnings, ensure_ascii=False,
+                                      indent=1), encoding="utf-8")
+                        st.warning("Перевірте вручну:\n" +
+                                  "\n".join(f"- {w}" for w in qwarnings))
 
                     # 5. excel
                     st.write("**5/5 Excel**")

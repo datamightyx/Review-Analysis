@@ -20,9 +20,9 @@ from collections import defaultdict
 from pathlib import Path
 
 from .llm import LLM, run_async
-from .models import ExtractedPhrase, Taxonomy
+from .models import ExtractedPhrase, Group, Taxonomy
 from .similarity import (auto_merge_target, merge_blocked, normalize,
-                         similarity, top_candidates)
+                         polarity_conflict, similarity, top_candidates)
 from . import embeddings
 from . import precedents
 from . import domain as _domain
@@ -247,6 +247,23 @@ GROUPING_SCHEMA = {
 }
 
 
+def polarity_conflicts(tax: Taxonomy, category: str) -> list[tuple[str, str, str]]:
+    """(group_id, row_a_text, row_b_text) for every pair of rows inside one
+    group of `category` that make OPPOSITE claims about a tracked attribute
+    (config.yaml: attribute_families) — e.g. "unscented" and "smells
+    amazing" sitting in the same group. No-op (empty list) when no families
+    are configured. Used by split_groups_async to force-review a group
+    regardless of its size, and by pipeline/quality.py to warn a human."""
+    out: list[tuple[str, str, str]] = []
+    for g in tax.groups_for(category):
+        cans = g.canonicals(tax)
+        for i, a in enumerate(cans):
+            for b in cans[i + 1:]:
+                if polarity_conflict(a.text, b.text):
+                    out.append((g.id, a.text, b.text))
+    return out
+
+
 def _unique_phrases(phrases: list[ExtractedPhrase]):
     """Deterministic pre-merge of exact normalized duplicates.
 
@@ -271,8 +288,11 @@ def _unique_phrases(phrases: list[ExtractedPhrase]):
             "pairs": defaultdict(list),
             "relation": p.relation,
             "gist": p.gist,
+            "quote_en": "",
         })
         b["counts"][p.product] += 1
+        if not b["quote_en"] and p.quote_en:
+            b["quote_en"] = p.quote_en.strip()
         if p.quote not in b["raws"][p.product]:
             b["raws"][p.product].append(p.quote)
         if p.review_id and p.review_id not in b["review_ids"][p.product]:
@@ -285,10 +305,17 @@ def _unique_phrases(phrases: list[ExtractedPhrase]):
 
 
 def _taxonomy_context(tax: Taxonomy, category: str,
-                      max_canonicals: int = 12) -> str:
-    """Groups with their top canonicals. Long tails are truncated to keep the
-    judge's attention on the structure; lexically relevant tail entries are
-    surfaced per-phrase via [similar: ...] hints instead."""
+                      max_canonicals: int | None = 12) -> str:
+    """Groups with their top canonicals. Long tails are truncated (when
+    max_canonicals is an int) to keep the judge's attention on the
+    structure during incremental grouping/reassign, where a
+    [similar: ...] hint surfaces relevant tail entries per-phrase anyway.
+    max_canonicals=None shows every row — required for consolidate_taxonomy
+    and split_groups_async, which propose MOVING/SPLITTING rows: a row the
+    prompt never shows can never be moved (measured: on a 26-group, ~470-row
+    taxonomy, 9 groups exceeded the old max_canonicals=30 cutoff — exactly
+    the groups later found to need splitting/moving, because consolidation
+    was structurally blind to their tail rows)."""
     groups = tax.groups_for(category)
     if not groups:
         return "(empty — this is the first batch, create groups as needed)"
@@ -299,9 +326,10 @@ def _taxonomy_context(tax: Taxonomy, category: str,
             head += f"  [usage_category: {g.usage_category}]"
         lines.append(head)
         cans = sorted(g.canonicals(tax), key=lambda c: -c.total)
-        for c in cans[:max_canonicals]:
+        shown = cans if max_canonicals is None else cans[:max_canonicals]
+        for c in shown:
             lines.append(f"  {c.id}: {c.text}  ({c.total})")
-        if len(cans) > max_canonicals:
+        if max_canonicals is not None and len(cans) > max_canonicals:
             lines.append(f"  … and {len(cans) - max_canonicals} more rows")
     return "\n".join(lines)
 
@@ -518,7 +546,13 @@ async def _group_category(tax: Taxonomy, category: str,
                 sample = next(iter(
                     q for qs in b["raws"].values() for q in qs), "")
                 extra = f'  [quote: "{sample}"]'
-            extra += _candidate_hint(tax, category, b["text"])
+            if b.get("quote_en"):
+                extra += f'  [translation: "{b["quote_en"]}"]'
+            # match on the English gloss when the phrase itself isn't
+            # English — a foreign quote has no lexical/embedding overlap
+            # with English canonicals, so [similar: ...] would otherwise
+            # come back empty and the judge never sees the candidate at all
+            extra += _candidate_hint(tax, category, b.get("quote_en") or b["text"])
             plines.append(f'[{j}] "{b["text"]}" (x{total}){extra}')
         user = (
             f"Category: {category}\n\n"
@@ -910,8 +944,12 @@ async def consolidate_taxonomy_async(tax: Taxonomy, llm: LLM,
     category order."""
     actions: list[str] = []
     cats = [c for c in _domain.active().ids() if len(tax.groups_for(c)) > 3]
+    # max_canonicals=None: a `moves` proposal can only target a row the
+    # judge actually saw (see _taxonomy_context's docstring) — the old
+    # cutoff of 30 silently exempted oversized groups from ever being
+    # cleaned up, which is exactly where over-merging accumulates.
     users = {category: (f"Category: {category}\n\nTAXONOMY:\n"
-                        f"{_taxonomy_context(tax, category, max_canonicals=30)}")
+                        f"{_taxonomy_context(tax, category, max_canonicals=None)}")
              for category in cats}
     n_done = 0
 
@@ -1155,6 +1193,217 @@ async def merge_sibling_rows_async(tax: Taxonomy, llm: LLM,
     return actions
 
 
+# ---------- split pass: inverse of consolidate_taxonomy ----------
+#
+# consolidate_taxonomy, merge_sibling_rows and _verify_new_groups only ever
+# MERGE groups/rows together. Groups are otherwise only ever created during
+# the very first batch-placement pass (group_phrases), before the taxonomy's
+# real structure exists yet — so a theme that first pass lumped into an
+# early mega-group (e.g. "Hamster Loves It" absorbing a distinct "litter box
+# use" theme) had no later pass that could ever pull it back out. This pass
+# is that missing inverse: it proposes splitting an OVERSIZED group into 2-4
+# real subgroups, or moving individual rows into a SIBLING group that
+# already covers their theme.
+#
+# Placed AFTER consolidate_taxonomy (sees the deduplicated group set) and
+# BEFORE reassign_phrases: reassign then replays the WHOLE corpus against
+# the enriched taxonomy, so a freshly split group only needs a few seed rows
+# here — reassign pulls in every matching phrase from every product/batch on
+# its own, no extra machinery needed.
+
+SPLIT_SYSTEM = """\
+You are shown ONE oversized group of a customer-review taxonomy (GROUP = one
+broad theme worth a single bullet point) — every row it currently holds with
+its vote count, the names of its SIBLING groups already in this category (so
+you never invent a duplicate of one that exists), and any THEMES already
+established elsewhere in this corpus.
+
+Decide whether this group actually bundles MORE THAN ONE distinct selling
+point / complaint / usage type / requested change. If so, propose the
+MINIMAL split that fixes it:
+
+ - splits: 2-4 NEW subgroups, each a genuinely distinct theme worth its own
+   bullet on a product page. List the canonical_ids (copied VERBATIM) that
+   belong to each. A subgroup needs at least 2 rows carrying real content —
+   never split off a single stray row.
+ - moves: individual rows whose theme is ALREADY covered by a SIBLING group
+   listed below — give that sibling's group_id instead of creating a
+   duplicate-named subgroup.
+
+Leave EVERY row you do not mention exactly where it is — the original group
+keeps its name and whatever rows remain.
+
+Do NOT split off:
+ - phrasing variants or sub-cases of the same point (that nuance belongs at
+   the row level INSIDE one group, not as a separate group);
+ - a row that merely mentions a second attribute in passing when its
+   dominant angle still matches the group.
+
+ALWAYS split off rows that make an OPPOSITE claim about the same tracked
+attribute from rows making the positive claim (e.g. "no scent at all" vs "a
+pleasant floral scent" are different, sometimes contradictory, selling
+points — never one group), even when the group is otherwise small.
+
+If a THEME PRESENT ELSEWHERE IN THIS CORPUS matches a cluster of rows here,
+name your split subgroup to MATCH that theme's wording, so rows from other
+categories/products can converge on it later.
+
+When the group really is one coherent theme, return empty splits and moves.
+All ids copied VERBATIM from the data below.
+"""
+
+SPLIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "splits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "canonical_ids": {"type": "array",
+                                     "items": {"type": "string"}},
+                },
+                "required": ["name", "canonical_ids"],
+                "additionalProperties": False,
+            },
+        },
+        "moves": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "canonical_id": {"type": "string"},
+                    "target_group_id": {"type": "string"},
+                },
+                "required": ["canonical_id", "target_group_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["splits", "moves"],
+    "additionalProperties": False,
+}
+
+
+def _apply_split_result(tax: Taxonomy, category: str, group: Group,
+                        result: dict) -> list[str]:
+    """Apply one group's split/move decisions to the taxonomy. Pure/testable
+    without an LLM: `result` is the already-parsed judge answer. Rejects any
+    move/split referencing a row that isn't actually still in `group` (e.g.
+    an earlier job in the same pass already relocated it) or a subgroup too
+    small to be a real theme (< 2 rows or < 3 total votes) — those rows
+    simply stay put, no error."""
+    actions: list[str] = []
+    used_ids: set[str] = set()
+    for mv in result.get("moves", []):
+        cid = (mv.get("canonical_id") or "").strip()
+        tgt = (mv.get("target_group_id") or "").strip()
+        c = tax.canonicals.get(cid)
+        target = tax.groups.get(tgt)
+        if (not c or c.group_id != group.id or not target
+                or target.category != category or target.id == group.id):
+            continue
+        _relocate_canonical(tax, c, target)
+        used_ids.add(cid)
+        actions.append(f"[{category}] рядок «{c.text}» перенесено з "
+                       f"«{group.name}» у «{target.name}»")
+    for sp in result.get("splits", []):
+        name = (sp.get("name") or "").strip()
+        ids = [i for i in sp.get("canonical_ids", []) if i not in used_ids]
+        cans = [tax.canonicals[i] for i in ids
+               if i in tax.canonicals and tax.canonicals[i].group_id == group.id]
+        if not name or len(cans) < 2 or sum(c.total for c in cans) < 3:
+            continue
+        new_g = tax.new_group(category, name)
+        for c in cans:
+            c.group_id = new_g.id
+            used_ids.add(c.id)
+        actions.append(f"[{category}] «{name}» виділено з «{group.name}» "
+                       f"({len(cans)} рядків, "
+                       f"{sum(c.total for c in cans)} голосів)")
+    return actions
+
+
+def split_groups(tax: Taxonomy, llm: LLM, progress=None,
+                 audit: list | None = None, min_share: float = 0.12,
+                 min_rows: int = 25) -> list[str]:
+    return run_async(split_groups_async(tax, llm, progress=progress,
+                                        audit=audit, min_share=min_share,
+                                        min_rows=min_rows))
+
+
+async def split_groups_async(tax: Taxonomy, llm: LLM, progress=None,
+                             audit: list | None = None,
+                             min_share: float = 0.12,
+                             min_rows: int = 25) -> list[str]:
+    """A group is a split candidate when it holds >= min_share of its
+    category's total votes, or >= min_rows distinct canonical rows, or
+    contains a polarity conflict (similarity.polarity_conflict) regardless
+    of size — an "unscented"/"smells amazing" pair is wrong at any size.
+    One independent LLM call per candidate group; results are applied in
+    job order so output stays deterministic regardless of gather()
+    completion order (same pattern as consolidate_taxonomy_async)."""
+    actions: list[str] = []
+    dom = _domain.active()
+    cats = list(dom.ids())
+    cat_totals = {cat: sum(g.total(tax) for g in tax.groups_for(cat)) or 1
+                 for cat in cats}
+    other_themes_by_cat = {
+        cat: sorted({og.name for cat2 in cats if cat2 != cat
+                    for og in tax.groups_for(cat2) if og.total(tax) >= 5})
+        for cat in cats
+    }
+
+    jobs: list[tuple[str, Group]] = []
+    for cat in cats:
+        conflict_gids = {gid for gid, _, _ in polarity_conflicts(tax, cat)}
+        for g in tax.groups_for(cat):
+            rows = g.canonicals(tax)
+            if len(rows) < 2:
+                continue
+            if (g.id in conflict_gids
+                    or g.total(tax) / cat_totals[cat] >= min_share
+                    or len(rows) >= min_rows):
+                jobs.append((cat, g))
+
+    n_done = 0
+
+    async def call(cat: str, group: Group) -> dict:
+        nonlocal n_done
+        sibling_lines = [f"  {sg.id}: {sg.name}"
+                         for sg in tax.groups_for(cat) if sg.id != group.id]
+        row_lines = [f'  {c.id}: "{c.text}"  ({c.total})' for c in
+                    sorted(group.canonicals(tax), key=lambda c: -c.total)]
+        lines = [f"Category: {cat}", "",
+                f"GROUP TO REVIEW: {group.name}  "
+                f"(total votes: {group.total(tax)})",
+                "ROWS:"] + row_lines
+        lines += ["", "SIBLING GROUPS (do not duplicate these themes):"]
+        lines += sibling_lines
+        if other_themes_by_cat[cat]:
+            lines += ["", "THEMES PRESENT ELSEWHERE IN THIS CORPUS:"]
+            lines += [f"  - {t}" for t in other_themes_by_cat[cat]]
+        result = await llm.json_call_async(SPLIT_SYSTEM, "\n".join(lines),
+                                           SPLIT_SCHEMA)
+        n_done += 1
+        if progress:
+            progress(cat, n_done, len(jobs))
+        return result
+
+    results = await asyncio.gather(*(call(cat, g) for cat, g in jobs))
+
+    for (cat, group), result in zip(jobs, results):
+        if group.id not in tax.groups:
+            continue   # emptied by an earlier job's moves in this same pass
+        group_actions = _apply_split_result(tax, cat, group, result)
+        actions.extend(group_actions)
+        if audit is not None and group_actions:
+            audit.append({"type": "split", "category": cat,
+                          "group": group.name, "changes": len(group_actions)})
+    return actions
+
+
 # ---------- final reassignment pass ----------
 
 REASSIGN_SYSTEM = """\
@@ -1272,8 +1521,11 @@ async def reassign_phrases_async(phrases: list[ExtractedPhrase],
             plines = []
             for j, b in enumerate(batch):
                 total = sum(b["counts"].values())
-                plines.append(f'[{j}] "{b["text"]}" (x{total})'
-                              + _hint_from_items(items, b["text"]))
+                line = f'[{j}] "{b["text"]}" (x{total})'
+                if b.get("quote_en"):
+                    line += f'  [translation: "{b["quote_en"]}"]'
+                line += _hint_from_items(items, b.get("quote_en") or b["text"])
+                plines.append(line)
             user = (
                 f"Category: {category}\n\n"
                 f"PHRASES TO PLACE:\n" + "\n".join(plines)
@@ -1488,10 +1740,29 @@ def apply_overrides(tax: Taxonomy, path: Path) -> None:
       "merge_groups":     [["Keep this group", "Merge this in", "And this"]],
       "move_canonical":   {"canonical phrase text": "Target group name"},
       "merge_canonicals": [["Keep this phrase", "Merge this phrase in", "..."]],
+      "create_group":     [{"category": "positive", "name": "Litter box use",
+                            "rows": ["He designated it as his litter box",
+                                     "immediately started using it to potty"]}],
       "dual_place":       [{"quote": "raw review quote naming two benefits",
                             "rows": ["Row A canonical text", "Row B canonical text"]}]
     }
     Applied after grouping on every run — corrections survive reruns.
+
+    move_canonical now AUTO-CREATES the target group when no group of that
+    name exists yet in the SAME category as the row being moved (previously
+    a typo'd or not-yet-existing target name silently did nothing — a manual
+    fix to an over-merged taxonomy had no way to survive the next run).
+    Matching is scoped to the moved row's own category — a same-named group
+    in a DIFFERENT category is never used as the target, even if the name
+    happens to collide.
+
+    create_group is the general tool for the same problem in the other
+    direction: hand-carve a new USP (or a wholly new one) out of any
+    existing rows in one category, by their exact canonical text. Reuses an
+    existing same-named group in that category if one exists, else creates
+    it. This is how a human fixes a mega-group the automated split pass
+    (grouping.split_groups) missed or under-split, in a way that survives
+    every subsequent run.
 
     dual_place counts ONE review in two canonical rows (typically two rows of
     the same USP group, e.g. a quote naming both "an emergency" and a "first
@@ -1508,9 +1779,17 @@ def apply_overrides(tax: Taxonomy, path: Path) -> None:
         return next((g for g in tax.groups.values()
                      if normalize(g.name) == normalize(name)), None)
 
+    def find_group_in(name: str, category: str):
+        return next((g for g in tax.groups_for(category)
+                     if normalize(g.name) == normalize(name)), None)
+
     def find_canonical(text: str):
         return next((c for c in tax.canonicals.values()
                      if normalize(c.text) == normalize(text)), None)
+
+    def canonical_category(c) -> str:
+        g = tax.groups.get(c.group_id)
+        return g.category if g else ""
 
     for old, new in ov.get("rename", {}).items():
         g = find_group(old)
@@ -1537,11 +1816,32 @@ def apply_overrides(tax: Taxonomy, path: Path) -> None:
             del tax.groups[other.id]
 
     for text, target_name in ov.get("move_canonical", {}).items():
-        target = find_group(target_name)
-        if not target:
+        nt = normalize(text)
+        for c in [c for c in tax.canonicals.values()
+                 if normalize(c.text) == nt]:
+            cat = canonical_category(c)
+            if not cat:
+                continue
+            target = find_group_in(target_name, cat)
+            if target is None:
+                target = tax.new_group(cat, target_name)
+            if c.group_id != target.id:
+                _relocate_canonical(tax, c, target)
+
+    for spec in ov.get("create_group", []):
+        cat = (spec.get("category") or "").strip()
+        name = (spec.get("name") or "").strip()
+        rows = [t for t in (spec.get("rows") or []) if t and t.strip()]
+        if not cat or not name or not rows:
             continue
-        for c in list(tax.canonicals.values()):
-            if c.group_id != target.id and normalize(c.text) == normalize(text):
+        target = find_group_in(name, cat)
+        if target is None:
+            target = tax.new_group(cat, name)
+        for row_text in rows:
+            nt = normalize(row_text)
+            for c in [c for c in tax.canonicals.values()
+                     if canonical_category(c) == cat
+                     and normalize(c.text) == nt and c.group_id != target.id]:
                 _relocate_canonical(tax, c, target)
 
     for texts in ov.get("merge_canonicals", []):

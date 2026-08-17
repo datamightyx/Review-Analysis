@@ -35,9 +35,10 @@ from pipeline.extract import (extract_phrases, validate_verbatim,
 from pipeline.grouping import (group_phrases, apply_overrides,
                                consolidate_taxonomy, reassign_phrases,
                                consolidate_rows, merge_sibling_rows,
-                               reconcile_votes)
+                               split_groups, reconcile_votes)
 from pipeline.excel_writer import save_workbook
-from pipeline.similarity import set_synonym_families
+from pipeline.quality import workbook_warnings
+from pipeline.similarity import set_synonym_families, set_attribute_families
 from pipeline.precedents import load_gate_precedents
 from pipeline.llm import LLM, set_max_concurrency
 from pipeline.models import Review, ExtractedPhrase, Taxonomy, product_key
@@ -104,6 +105,8 @@ def main() -> None:
                     help="пропустити фінальний пас перепризначення фраз")
     ap.add_argument("--no-row-merge", action="store_true",
                     help="пропустити LLM-пас злиття рядків-синонімів")
+    ap.add_argument("--no-split", action="store_true",
+                    help="пропустити пас розбиття мегагруп")
     ap.add_argument("--rows-only", action="store_true",
                     help="лише злити рядки-синоніми в наявній таксономії "
                          "(без екстракції/групування) і перегенерувати Excel")
@@ -130,12 +133,26 @@ def main() -> None:
     # optional per-config deterministic synonym families (see config.yaml);
     # must be installed before any grouping/consolidation pass
     set_synonym_families(cfg.get("synonym_families"))
+    # per-run polarity-tracked attribute families (config.yaml:
+    # attribute_families) — must be installed before any grouping/
+    # consolidation/split pass, same as synonym_families above.
+    set_attribute_families(cfg.get("attribute_families"))
     folder = Path(args.folder)
     if not folder.exists():
         sys.exit(f"Немає папки: {folder}")
     # per-product domain profile (categories + Excel layout). Absent =>
     # the built-in default (the original five categories). Must be installed
-    # before any extraction/grouping/excel pass.
+    # before any extraction/grouping/excel pass. An ABSENT domain.yaml is
+    # not an error — but it silently reverts the grouping judge's few-shot
+    # examples to the built-in wound-care ones (judge_examples in
+    # domain.default_domain()), which the pipeline's own docs say can cost
+    # up to 0.2 F1 on an unrelated product line. Surface that instead of
+    # staying silent.
+    if not (folder / "domain.yaml").exists():
+        print("  (!) domain.yaml відсутній — використано профіль за "
+              "замовчуванням (категорії й приклади для косметики першої "
+              "допомоги). Якщо це не той домен: python run.py "
+              f"{folder} --init-domain")
     try:
         domain_mod.set_active_domain(domain_mod.load_domain(folder))
     except (ValueError, KeyError) as e:
@@ -327,6 +344,20 @@ def main() -> None:
             audit.extend({"type": "consolidate", "category": "",
                           "action": a} for a in actions)
 
+    # ---- 4b2. split pass: break up mega-groups the first pass couldn't ----
+    # (consolidate_taxonomy/merge_sibling_rows/_verify_new_groups only ever
+    # merge — this is the inverse, and must run before reassign so reassign
+    # can replay the whole corpus against the newly split structure)
+    if not args.no_split and cfg.get("split", True):
+        s_actions = split_groups(tax, llm_consolidate,
+                                 min_share=cfg.get("split_min_share", 0.12),
+                                 min_rows=cfg.get("split_min_rows", 25),
+                                 audit=audit)
+        if s_actions:
+            print("Розбиття мегагруп:")
+            for a in s_actions:
+                print(f"  {a}")
+
     # ---- 4c. reassignment: replay the corpus against the final taxonomy ----
     if not args.no_reassign and cfg.get("reassign", True):
         def rprog(cat, done, total):
@@ -369,6 +400,17 @@ def main() -> None:
     if audit:
         print(f"  (!) місць для людської перевірки: {len(audit)} "
               f"(review_queue.json / вкладка «Перевірити» в GUI)")
+
+    # ---- 4f. quality guardrail: deterministic checks, no LLM ----
+    qwarnings = workbook_warnings(tax)
+    if qwarnings:
+        (folder / "quality_warnings.json").write_text(
+            json.dumps(qwarnings, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        print(f"  (!) перевірте вручну: {len(qwarnings)} "
+              f"(quality_warnings.json)")
+        for w in qwarnings:
+            print(f"    (!) {w}")
 
     # ---- 5. excel ----
     written = save_workbook(tax, products, out_path)

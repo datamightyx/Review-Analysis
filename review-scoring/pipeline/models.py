@@ -52,6 +52,13 @@ class ExtractedPhrase:
     review_id: str
     relation: str = ""     # usage only: body part / animal / situation
     gist: str = ""         # improvement only: short label of the wish
+    # English gloss of `quote` when it is NOT already English — internal
+    # matching aid only, never shown in the workbook (which always displays
+    # `quote` verbatim). Empty for English quotes. Without this a non-English
+    # verbatim quote has no lexical/embedding overlap with its English
+    # canonicals, so it never merges and instead sits as its own
+    # single-vote row, silently splitting the vote of a real USP.
+    quote_en: str = ""
 
 
 @dataclass

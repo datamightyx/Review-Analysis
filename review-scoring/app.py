@@ -42,7 +42,7 @@ from pipeline.grouping import (group_phrases, apply_overrides, normalize,
                                split_groups)
 from pipeline.excel_writer import save_workbook
 from pipeline.quality import workbook_warnings
-from pipeline.llm import LLM, set_max_concurrency
+from pipeline.llm import LLM, set_max_concurrency, ANTHROPIC_PRICING
 from pipeline.models import Taxonomy, product_key
 from pipeline.precedents import (GatePrecedents, aggregate_rule_weights,
                                  load_gate_precedents, rebuild_shared_weights)
@@ -50,6 +50,23 @@ from pipeline import domain as domain_mod
 from storage.db_client import (product_db, root_db, close_product_db,
                                PRODUCT_DB_NAME, ROOT_DB_NAME)
 from storage import r2_sync
+
+# known models per provider, for the "Моделі за кроками" selects on the Run
+# tab — the anthropic list comes straight from the pricing table (llm.py) so
+# it can't drift out of sync; openrouter slugs are curated since OpenRouter's
+# catalogue is much larger than what this pipeline is tuned for.
+MODEL_CHOICES = {
+    "anthropic": sorted(ANTHROPIC_PRICING.keys()),
+    "openrouter": [
+        "anthropic/claude-opus-4.8",
+        "anthropic/claude-sonnet-5",
+        "anthropic/claude-sonnet-4.5",
+        "anthropic/claude-haiku-4.5",
+        "openai/gpt-oss-120b:free",
+    ],
+}
+MODEL_FROM_CONFIG = "— з config.yaml —"
+MODEL_CUSTOM = "Інша (вписати)…"
 
 CAT_LABELS = {
     "positive": "✅ Positive",
@@ -673,7 +690,38 @@ with tab_run:
             with c3:
                 fresh = st.checkbox("🔄 Таксономія з нуля (--fresh)",
                                     help="Інакше нові фрази наповнюють існуючі групи")
-                model = st.text_input("Модель (порожньо = з config.yaml)", value="")
+
+            st.markdown("**🤖 Моделі за кроками** (порожньо = з config.yaml)")
+            provider_ui = cfg.get("provider", "anthropic")
+            choices = MODEL_CHOICES.get(provider_ui, MODEL_CHOICES["anthropic"])
+
+            def model_select(label: str, cfg_key: str, ui_key: str,
+                             cfg_default: str = "model") -> str | None:
+                """Selectbox for one pipeline role's model override. Returns
+                None (=> caller falls back to config.yaml) unless the user
+                picked a specific model or typed a custom slug."""
+                current = cfg.get(cfg_key) or (cfg.get(cfg_default) if cfg_default else None)
+                options = [MODEL_FROM_CONFIG] + choices + [MODEL_CUSTOM]
+                sel = st.selectbox(f"{label} (нині: {current or '—'})",
+                                   options, key=f"model_sel_{ui_key}")
+                if sel == MODEL_CUSTOM:
+                    custom = st.text_input("Слаг моделі", key=f"model_custom_{ui_key}")
+                    return custom.strip() or None
+                if sel == MODEL_FROM_CONFIG:
+                    return None
+                return sel
+
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+            with mc1:
+                model_group = model_select("Групування", "model", "group")
+            with mc2:
+                model_extract = model_select("Екстракція", "extract_model", "extract")
+            with mc3:
+                model_consolidate = model_select("Консолідація", "consolidate_model", "consolidate")
+            with mc4:
+                model_verify = model_select("Перевірка нових груп", "model", "verify")
+            with mc5:
+                model_reassign = model_select("Перепризначення", "reassign_model", "reassign")
 
             run_clicked = st.button("▶️ Запустити", type="primary", width="stretch")
 
@@ -719,30 +767,30 @@ with tab_run:
 
                     provider = cfg.get("provider", "anthropic")
                     db = product_db(folder)
-                    llm_group = LLM(model=model.strip() or cfg.get("model"),
+                    llm_group = LLM(model=model_group or cfg.get("model"),
                               cache=db,
                               effort=cfg.get("effort", "medium"),
                               provider=provider)
                     llm_extract = LLM(
-                              model=model.strip() or cfg.get("extract_model") or cfg.get("model"),
+                              model=model_extract or cfg.get("extract_model") or cfg.get("model"),
                               cache=db,
                               effort=cfg.get("extract_effort") or cfg.get("effort", "medium"),
                               provider=provider)
                     llm_consolidate = LLM(
-                              model=model.strip() or cfg.get("consolidate_model") or cfg.get("model"),
+                              model=model_consolidate or cfg.get("consolidate_model") or cfg.get("model"),
                               cache=db,
                               effort=cfg.get("consolidate_effort") or cfg.get("effort", "medium"),
                               provider=provider)
                     # narrow lexical dedup of new groups — its own (lower) effort
                     llm_verify = LLM(
-                              model=model.strip() or cfg.get("model"),
+                              model=model_verify or cfg.get("model"),
                               cache=db,
                               effort=cfg.get("verify_effort") or cfg.get("effort", "medium"),
                               provider=provider)
                     # replay against a FINAL taxonomy (matching, not building) —
                     # its own (lower) effort; reasoning output is the main cost
                     llm_reassign = LLM(
-                              model=model.strip() or cfg.get("reassign_model") or cfg.get("model"),
+                              model=model_reassign or cfg.get("reassign_model") or cfg.get("model"),
                               cache=db,
                               effort=cfg.get("reassign_effort") or cfg.get("effort", "medium"),
                               provider=provider)

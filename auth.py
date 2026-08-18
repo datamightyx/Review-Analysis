@@ -37,7 +37,8 @@ import streamlit as st
 from dotenv import load_dotenv
 
 # .env лежить поруч із цим файлом; шукаємо саме там, а не від поточної теки
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(ENV_PATH)
 
 ALGO = "pbkdf2_sha256"
 ITERATIONS = 260_000
@@ -71,24 +72,69 @@ def verify_password(password, stored):
     return hmac.compare_digest(password, stored)
 
 
-def _stored_secret():
-    """(значення, чи_це_хеш) з env або st.secrets."""
-    env_hash = (os.environ.get("APP_PASSWORD_HASH") or "").strip()
-    if env_hash:
-        return env_hash, True
+# Розкладки, які приймаємо в secrets.toml: (секція|None, ключ, це_хеш).
+# Одна жорстко зашита розкладка — часта причина «не задано»: у файлі пароль є,
+# але під іншим ключем, і застосунок про це мовчить.
+SECRET_SHAPES = (
+    ("auth", "password_hash",     True),
+    ("auth", "APP_PASSWORD_HASH", True),
+    (None,   "APP_PASSWORD_HASH", True),
+    ("auth", "password",          False),
+    ("auth", "APP_PASSWORD",      False),
+    (None,   "APP_PASSWORD",      False),
+)
 
+
+def _read_secrets():
+    """(об'єкт secrets|None, імена ключів верхнього рівня, текст помилки|None).
+
+    Парсинг відбувається при першому доступі, тому помилковий TOML вилазить
+    саме тут. Розрізняємо «файлу немає» і «файл є, але зламаний» — інакше обидва
+    випадки виглядають як «пароль не налаштовано».
+    """
     try:
-        secret = st.secrets["auth"]["password_hash"]
-    except Exception:
-        secret = None
-    if secret:
-        return str(secret).strip(), True
+        secrets = st.secrets
+        return secrets, sorted(secrets.keys()), None
+    except Exception as e:
+        name = type(e).__name__
+        if "SecretNotFound" in name or isinstance(e, FileNotFoundError):
+            return None, [], None
+        return None, [], f"{name}: {e}"
 
-    env_plain = (os.environ.get("APP_PASSWORD") or "").strip()
-    if env_plain:
-        return env_plain, False
 
-    return None, False
+def _stored_secret():
+    """(значення, чи_це_хеш, діагностика) з env або st.secrets."""
+    diag = {"secrets_keys": [], "secrets_error": None, "found_at": None}
+
+    # Перечитуємо .env щоразу: Streamlit не переімпортовує вже завантажені
+    # модулі між rerun-ами, тому імпортного load_dotenv замало — дописаний у
+    # запущеному застосунку рядок інакше не підхопиться до рестарту
+    load_dotenv(ENV_PATH, override=False)
+
+    for var, is_hash in (("APP_PASSWORD_HASH", True), ("APP_PASSWORD", False)):
+        value = (os.environ.get(var) or "").strip()
+        if value:
+            diag["found_at"] = f"env: {var}"
+            return value, is_hash, diag
+
+    secrets, keys, error = _read_secrets()
+    diag["secrets_keys"] = keys
+    diag["secrets_error"] = error
+    if secrets is None:
+        return None, False, diag
+
+    for section, key, is_hash in SECRET_SHAPES:
+        try:
+            container = secrets[section] if section else secrets
+            value = container[key]
+        except Exception:
+            continue
+        value = str(value).strip()
+        if value:
+            diag["found_at"] = f"secrets: {section + '.' if section else ''}{key}"
+            return value, is_hash, diag
+
+    return None, False, diag
 
 
 def _lockout_left():
@@ -125,19 +171,44 @@ def _login_form(stored):
                 st.error(f"Невірний пароль ({attempts} з {MAX_ATTEMPTS}).")
 
 
-def _setup_hint():
+def _setup_hint(diag):
     st.title("🔒 Пароль не налаштовано")
-    st.error("Вхід закритий: не задано ні `APP_PASSWORD_HASH`, ні `APP_PASSWORD`.")
+    st.error("Вхід закритий: пароль не знайдено ні в env, ні в `st.secrets`.")
+
+    if diag["secrets_error"]:
+        st.warning(
+            "`st.secrets` не читається — найчастіше це синтаксис TOML "
+            "(значення без лапок, зайва кома, збита секція):\n\n"
+            f"```\n{diag['secrets_error']}\n```"
+        )
+    elif diag["secrets_keys"]:
+        st.info(
+            "`st.secrets` прочитано, ключі верхнього рівня: "
+            + ", ".join(f"`{k}`" for k in diag["secrets_keys"])
+            + " — але жоден із очікуваних не підійшов."
+        )
+    else:
+        st.info("`st.secrets` порожній або файлу секретів немає.")
+
     st.markdown(
-        "Згенеруй хеш і поклади його в `.env` поруч з `app.py`:\n\n"
-        "```bash\n"
-        "python auth.py\n"
+        "Приймається будь-яка з цих розкладок у `secrets.toml` "
+        "(або в Streamlit Cloud → Settings → Secrets):\n\n"
+        "```toml\n"
+        "[auth]\n"
+        'password_hash = "pbkdf2_sha256$260000$<salt>$<hash>"\n'
+        "```\n"
+        "або плоским ключем:\n"
+        "```toml\n"
+        'APP_PASSWORD_HASH = "pbkdf2_sha256$260000$<salt>$<hash>"\n'
         "```\n\n"
-        "Скрипт запитає пароль і надрукує готовий рядок:\n\n"
+        "Значення обов'язково **в подвійних лапках** — без них TOML не "
+        "розбереться, і секрети не завантажаться цілком.\n\n"
+        "Локально те саме працює через `.env` поруч з `app.py`:\n"
         "```\n"
         "APP_PASSWORD_HASH=pbkdf2_sha256$260000$<salt>$<hash>\n"
-        "```\n\n"
-        "Після цього перезапусти застосунок."
+        "```\n"
+        "(у `.env` лапки не потрібні)\n\n"
+        "Згенерувати новий хеш: `python auth.py`."
     )
 
 
@@ -162,10 +233,22 @@ def require_auth(logout_button=True):
             render_logout()
         return
 
-    stored, is_hash = _stored_secret()
+    stored, is_hash, diag = _stored_secret()
     if not stored:
-        _setup_hint()
+        _setup_hint(diag)
         st.stop()
+
+    if is_hash and not stored.startswith(f"{ALGO}$"):
+        st.warning(
+            "Значення схоже не на хеш `pbkdf2_sha256$...`. Якщо це відкритий "
+            "пароль — він однаково спрацює, але краще згенеруй хеш: `python auth.py`."
+        )
+    elif is_hash and len(stored.split("$")) != 4:
+        st.error(
+            "Хеш обрізаний або склеєний: очікується "
+            "`pbkdf2_sha256$<iterations>$<salt>$<hash>` — чотири частини через `$`. "
+            "Перевір, чи значення скопійоване цілком."
+        )
 
     _login_form(stored)
     if not is_hash:

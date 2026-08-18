@@ -23,7 +23,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from auth import require_auth  # noqa: E402
+from auth import require_auth, secrets_value  # noqa: E402
 from returns_analysis_api import (  # noqa: E402
     REQUIRED_ENV,
     build_workbook,
@@ -56,10 +56,10 @@ st.markdown(
 
 # ── 0. Доступи SP-API ──────────────────────────────────────────────────────────
 #
-# Значення з .env — лише початкове заповнення. Введене в панелі живе в
-# st.session_state (пам'ять сервера, на диск не пишеться) і перекриває .env для
-# цієї сесії. Секрети не попадають у ключ кешу: туди йде лише короткий
-# відбиток (fingerprint), див. cache_key нижче.
+# Порядок джерел: .env -> st.secrets[sp_api] -> введене в панелі. Останнє живе в
+# st.session_state (пам'ять сервера, на диск не пишеться) і перекриває обидва
+# попередні для цієї сесії. Секрети не попадають у ключ кешу: туди йде лише
+# короткий відбиток (fingerprint), див. cache_key нижче.
 
 ENDPOINTS = {
     "North America (NA)": "https://sellingpartnerapi-na.amazon.com",
@@ -84,6 +84,14 @@ MARKETPLACES = {
 }
 CUSTOM_MP = "Інший (ввести вручну)"
 
+# На Streamlit Cloud .env не існує, тому ті самі значення читаються зі secrets.
+# Приймаємо і зручний [sp_api] з короткими ключами, і дослівні SP_API_* —
+# у секції або плоско.
+SECRET_PATHS = {
+    k: (("sp_api", k.replace("SP_API_", "").lower()), ("sp_api", k), (None, k))
+    for k in REQUIRED_ENV
+}
+
 FIELD_LABEL = {
     "SP_API_LWA_CLIENT_ID":     "LWA Client ID",
     "SP_API_LWA_CLIENT_SECRET": "LWA Client Secret",
@@ -103,11 +111,13 @@ def mask(value, keep=4):
 def credentials_panel():
     """Сайдбар з доступами. Повертає (cfg, fingerprint, sources)."""
     env_cfg = {k: (os.environ.get(k) or "").strip() for k in REQUIRED_ENV}
+    sec_cfg = {k: secrets_value(*SECRET_PATHS[k]) for k in REQUIRED_ENV}
+    base_cfg = {k: env_cfg[k] or sec_cfg[k] for k in REQUIRED_ENV}
 
     with st.sidebar:
         st.subheader("🔐 Доступи SP-API")
 
-        cfg = {k: st.session_state.get(f"cred_{k}", env_cfg[k]) for k in REQUIRED_ENV}
+        cfg = {k: st.session_state.get(f"cred_{k}", base_cfg[k]) for k in REQUIRED_ENV}
         filled = [k for k in REQUIRED_ENV if cfg[k]]
         if len(filled) == len(REQUIRED_ENV):
             badge, text = "cred-ok", "готово до запиту"
@@ -119,11 +129,15 @@ def credentials_panel():
             f'<span class="cred-badge {badge}">{text}</span>', unsafe_allow_html=True
         )
 
-        from_env = [k for k in REQUIRED_ENV if env_cfg[k]]
-        if from_env:
+        picked = []
+        if any(env_cfg.values()):
+            picked.append(f"<code>.env</code> — {sum(1 for v in env_cfg.values() if v)}")
+        if any(sec_cfg.values()):
+            picked.append(f"<code>secrets</code> — {sum(1 for v in sec_cfg.values() if v)}")
+        if picked:
             st.markdown(
-                f'<div class="cred-source">З <code>.env</code> підхоплено: '
-                f'{len(from_env)} з {len(REQUIRED_ENV)}</div>',
+                '<div class="cred-source">Підхоплено з ' + ", ".join(picked)
+                + f" (усього полів {len(REQUIRED_ENV)})</div>",
                 unsafe_allow_html=True,
             )
 
@@ -179,17 +193,28 @@ def credentials_panel():
 
             st.caption(
                 "Введене тут живе тільки в цій сесії й на диск не пишеться. "
-                "Щоб зберегти назавжди — впиши у `.env` поруч з `app.py`."
+                "Щоб зберегти назавжди — `.env` поруч з `app.py` (локально) "
+                "або `[sp_api]` у Streamlit secrets (на деплої):\n\n"
+                "```toml\n[sp_api]\nlwa_client_id = \"...\"\n"
+                "lwa_client_secret = \"...\"\nrefresh_token = \"...\"\n"
+                "marketplace_id = \"ATVPDKIKX0DER\"\n"
+                "endpoint = \"https://sellingpartnerapi-na.amazon.com\"\n```"
             )
 
         cfg["SP_API_ENDPOINT"] = ENDPOINTS[region]
         cfg["SP_API_MARKETPLACE_ID"] = marketplace
         cfg = {k: (v or "").strip() for k, v in cfg.items()}
 
-        sources = {
-            k: ("панель" if cfg[k] and cfg[k] != env_cfg[k] else ".env" if env_cfg[k] else "—")
-            for k in REQUIRED_ENV
-        }
+        def source_of(k):
+            if not cfg[k]:
+                return "—"
+            if cfg[k] != base_cfg[k]:
+                return "панель"
+            if env_cfg[k]:
+                return ".env"
+            return "secrets" if sec_cfg[k] else "панель"
+
+        sources = {k: source_of(k) for k in REQUIRED_ENV}
 
         st.markdown("**Поточні значення**")
         st.dataframe(
@@ -233,10 +258,14 @@ if missing_fields:
         "Заповни доступи SP-API у панелі ліворуч: **" + ", ".join(missing_fields) + "**"
     )
     st.info(
-        "Або поклади їх у `.env` поруч з `app.py`:\n\n"
+        "Або постійним джерелом — `.env` поруч з `app.py`:\n\n"
         "```\nSP_API_LWA_CLIENT_ID=...\nSP_API_LWA_CLIENT_SECRET=...\n"
         "SP_API_REFRESH_TOKEN=...\nSP_API_MARKETPLACE_ID=ATVPDKIKX0DER\n"
-        "SP_API_ENDPOINT=https://sellingpartnerapi-na.amazon.com\n```"
+        "SP_API_ENDPOINT=https://sellingpartnerapi-na.amazon.com\n```\n\n"
+        "На Streamlit Cloud `.env` не існує — там те саме через Settings → Secrets:\n\n"
+        "```toml\n[sp_api]\nlwa_client_id = \"...\"\nlwa_client_secret = \"...\"\n"
+        "refresh_token = \"...\"\nmarketplace_id = \"ATVPDKIKX0DER\"\n"
+        "endpoint = \"https://sellingpartnerapi-na.amazon.com\"\n```"
     )
     st.stop()
 

@@ -102,6 +102,27 @@ def _read_secrets():
         return None, [], f"{name}: {e}"
 
 
+def secrets_value(*paths):
+    """Перше непорожнє значення з st.secrets за списком (секція|None, ключ).
+
+    Спільна точка доступу до секретів: зламаний або відсутній secrets.toml тут
+    не кидає виняток, а дає порожній рядок — сторінки не мають падати через це.
+    """
+    secrets, _keys, _error = _read_secrets()
+    if secrets is None:
+        return ""
+
+    for section, key in paths:
+        try:
+            container = secrets[section] if section else secrets
+            value = container[key]
+        except Exception:
+            continue
+        if value:
+            return str(value).strip()
+    return ""
+
+
 def _stored_secret():
     """(значення, чи_це_хеш, діагностика) з env або st.secrets."""
     diag = {"secrets_keys": [], "secrets_error": None, "found_at": None}

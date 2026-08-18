@@ -12,7 +12,8 @@ st.markdown("---")
 st.markdown("""
 ### Оберіть звіт у меню ліворуч:
 
-- **Returns Analysis** — аналіз причин повернень по ASIN
+- **Returns Analysis** — аналіз причин повернень по ASIN (з файлу)
+- **Returns API** — те саме, але дані тягне SP-API: обираєш лише дати
 - **Review Scoring** — витяг і групування фраз з відгуків (PDF) у таксономію та Excel
 
 ---

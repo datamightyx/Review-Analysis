@@ -178,8 +178,79 @@ REFUND_NO_RETURN = "REFUND_NO_RETURN"
 STATUS_REFUND_ONLY = "Refund - No Return"
 
 
-def load_refund_only_rows(transactions_path, returns_df):
-    """Refund events from a Unified Transaction CSV with no matching return line."""
+FINANCES_PATH = "/finances/v0/financialEvents"
+
+
+def fetch_refund_events(cfg, start, end, release_lag_days=7, progress=None):
+    """Refund events for the window straight from the Finances API.
+
+    GET_DATE_RANGE_FINANCIAL_TRANSACTION_DATA (report type 1202) is not grantable
+    for this account ("Request for report type 1202 is not allowed at this
+    time"), so refunds come from /finances/v0/financialEvents instead. Windows
+    are UTC, matching the returns report; the Unified Transaction CSV is PT.
+
+    PostedDate here is the *release* timestamp, not the moment of the refund:
+    verified against the Unified Transaction CSV, every late row lines up with
+    its "Transaction Release Date" (refund Aug 10 -> API 2026-08-16T14:51:40Z),
+    and refunds still Deferred are absent entirely. Release runs a few days
+    behind, so the upper bound is padded by release_lag_days to catch refunds
+    made inside the window but released after it. The trade-off: refunds truly
+    made in those extra days are pulled in too. Pass 0 for a strict window.
+
+    Returns the normalized frame: order_id, sku, quantity, posted (naive UTC).
+    """
+    access_token = get_access_token(cfg)
+    url = f"{cfg['SP_API_ENDPOINT']}{FINANCES_PATH}"
+    headers = {"x-amz-access-token": access_token}
+
+    upper = pd.Timestamp(end) + pd.Timedelta(days=release_lag_days, hours=23, minutes=59)
+    # the API rejects a PostedBefore in the future
+    now_utc = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(minutes=5)
+    upper = min(upper, now_utc)
+
+    rows, next_token, page = [], None, 0
+    while True:
+        if next_token:
+            params = {"NextToken": next_token}
+        else:
+            params = {
+                "MaxResultsPerPage": 100,
+                "PostedAfter": f"{start}T00:00:00Z",
+                "PostedBefore": upper.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        resp = requests.get(url, params=params, headers=headers, timeout=60)
+        if resp.status_code == 429:
+            time.sleep(5)
+            continue
+        resp.raise_for_status()
+        payload = resp.json()["payload"]
+
+        for event in payload.get("FinancialEvents", {}).get("RefundEventList", []):
+            for item in event.get("ShipmentItemAdjustmentList") or []:
+                rows.append({
+                    "order_id": event.get("AmazonOrderId"),
+                    "sku":      item.get("SellerSKU"),
+                    "quantity": item.get("QuantityShipped"),
+                    "posted":   event.get("PostedDate"),
+                })
+
+        page += 1
+        if progress:
+            progress(page, len(rows))
+        next_token = payload.get("NextToken")
+        if not next_token:
+            break
+        time.sleep(2.2)  # financialEvents is rate limited to 0.5 requests/sec
+
+    ref = pd.DataFrame(rows, columns=["order_id", "sku", "quantity", "posted"])
+    ref["quantity"] = pd.to_numeric(ref["quantity"], errors="coerce").fillna(0)
+    ref = ref[ref["quantity"] > 0]
+    ref["posted"] = pd.to_datetime(ref["posted"], errors="coerce", utc=True).dt.tz_localize(None)
+    return ref.reset_index(drop=True)
+
+
+def parse_transaction_refunds(transactions_path):
+    """Refund rows from a Unified Transaction CSV, in the same normalized shape."""
     with open(transactions_path, "rb") as f:
         raw = f.read()
     for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
@@ -203,12 +274,25 @@ def load_refund_only_rows(transactions_path, returns_df):
 
     ref = tx[tx["type"].astype(str).str.strip().str.lower() == "refund"].copy()
     ref = ref[ref["quantity"] > 0]  # quantity 0 == fee/tax-only adjustment line
-    ref["dt"] = pd.to_datetime(
+    posted = pd.to_datetime(
         ref["date/time"].str.replace(r"\s+P[DS]T$", "", regex=True),
         format="%b %d, %Y %I:%M:%S %p",
         errors="coerce",
     )
+    return pd.DataFrame({
+        "order_id": ref["order id"].values,
+        "sku":      ref["sku"].values,
+        "quantity": ref["quantity"].values,
+        "posted":   posted.values,
+    })
 
+
+def refunds_to_return_rows(ref, returns_df, verbose=True):
+    """Refund events with no matching return line, shaped like returns-report rows.
+
+    Match key is (order id, SKU). SKUs that never appear in the returns report
+    cannot be mapped to an ASIN, so they are dropped and reported.
+    """
     sku_asin = (
         returns_df.dropna(subset=["sku", "asin"])
         .groupby("sku")["asin"].agg(lambda s: s.value_counts().index[0]).to_dict()
@@ -219,16 +303,16 @@ def load_refund_only_rows(transactions_path, returns_df):
     )
 
     ret_keys = set(zip(returns_df["order-id"], returns_df["sku"]))
-    ref = ref[[(o, s) not in ret_keys for o, s in zip(ref["order id"], ref["sku"])]]
+    ref = ref[[(o, s) not in ret_keys for o, s in zip(ref["order_id"], ref["sku"])]]
 
-    unmapped = sorted(ref[~ref["sku"].isin(sku_asin)]["sku"].dropna().unique().tolist())
-    if unmapped:
-        print(f"  note: refund SKUs with no ASIN in the returns report, skipped: {unmapped}")
+    skipped = sorted(ref[~ref["sku"].isin(sku_asin)]["sku"].dropna().unique().tolist())
+    if skipped and verbose:
+        print(f"  note: refund SKUs with no ASIN in the returns report, skipped: {skipped}")
     ref = ref[ref["sku"].isin(sku_asin)]
 
-    return pd.DataFrame({
-        "return-date":        ref["dt"].values,
-        "order-id":           ref["order id"].values,
+    rows = pd.DataFrame({
+        "return-date":        ref["posted"].values,
+        "order-id":           ref["order_id"].values,
         "sku":                ref["sku"].values,
         "asin":               ref["sku"].map(sku_asin).values,
         "product-name":       ref["sku"].map(sku_name).values,
@@ -236,6 +320,14 @@ def load_refund_only_rows(transactions_path, returns_df):
         "reason":             REFUND_NO_RETURN,
         "customer-comments":  pd.NA,
     })
+    return rows, skipped
+
+
+def load_refund_only_rows(transactions_path, returns_df):
+    """CLI path: Unified Transaction CSV -> refund rows with no matching return."""
+    ref = parse_transaction_refunds(transactions_path)
+    rows, _ = refunds_to_return_rows(ref, returns_df)
+    return rows
 
 
 # ── Mismatch analysis (same logic as pages/1_Returns_Analysis.py) ──────────

@@ -1,5 +1,7 @@
 import io
+import os
 import re
+import sys
 
 import pandas as pd
 import streamlit as st
@@ -7,7 +9,13 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from auth import require_auth  # noqa: E402
+
 st.set_page_config(page_title="Returns Analysis", page_icon="📦", layout="wide")
+require_auth()
+
 st.title("📦 Returns Analysis")
 st.markdown("---")
 

@@ -23,6 +23,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from auth import require_auth  # noqa: E402
 from returns_analysis_api import (  # noqa: E402
     REQUIRED_ENV,
     build_workbook,
@@ -34,6 +35,8 @@ from returns_analysis_api import (  # noqa: E402
 )
 
 st.set_page_config(page_title="Returns Analysis (API)", page_icon="🔌", layout="wide")
+require_auth()
+
 st.title("🔌 Returns Analysis — напряму з SP-API")
 st.markdown("---")
 

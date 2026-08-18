@@ -13,6 +13,7 @@ refund-и беруться з Finances API, а не зі звіту транза
 """
 
 import datetime as dt
+import hashlib
 import io
 import os
 import sys
@@ -27,6 +28,7 @@ from returns_analysis_api import (  # noqa: E402
     build_workbook,
     fetch_customer_returns,
     fetch_refund_events,
+    get_access_token,
     parse_customer_returns,
     refunds_to_return_rows,
 )
@@ -35,16 +37,205 @@ st.set_page_config(page_title="Returns Analysis (API)", page_icon="🔌", layout
 st.title("🔌 Returns Analysis — напряму з SP-API")
 st.markdown("---")
 
-missing_env = [k for k in REQUIRED_ENV if not os.environ.get(k)]
-if missing_env:
+st.markdown(
+    """
+    <style>
+      .cred-badge {display:inline-block; padding:2px 10px; border-radius:999px;
+                   font-size:0.78rem; font-weight:600; letter-spacing:.02em;}
+      .cred-ok      {background:#DCF3E3; color:#12633A;}
+      .cred-partial {background:#FDF0D0; color:#8A5B00;}
+      .cred-missing {background:#FBDDDD; color:#8B1D1D;}
+      .cred-source  {color:#6B7280; font-size:0.78rem; margin-top:-6px;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ── 0. Доступи SP-API ──────────────────────────────────────────────────────────
+#
+# Значення з .env — лише початкове заповнення. Введене в панелі живе в
+# st.session_state (пам'ять сервера, на диск не пишеться) і перекриває .env для
+# цієї сесії. Секрети не попадають у ключ кешу: туди йде лише короткий
+# відбиток (fingerprint), див. cache_key нижче.
+
+ENDPOINTS = {
+    "North America (NA)": "https://sellingpartnerapi-na.amazon.com",
+    "Europe (EU)":        "https://sellingpartnerapi-eu.amazon.com",
+    "Far East (FE)":      "https://sellingpartnerapi-fe.amazon.com",
+}
+
+MARKETPLACES = {
+    "ATVPDKIKX0DER":  "US — amazon.com",
+    "A2EUQ1WTGCTBG2": "CA — amazon.ca",
+    "A1AM78C64UM0Y8": "MX — amazon.com.mx",
+    "A2Q3Y263D00KWC": "BR — amazon.com.br",
+    "A1F83G8C2ARO7P": "UK — amazon.co.uk",
+    "A1PA6795UKMFR9": "DE — amazon.de",
+    "A13V1IB3VIYZZH": "FR — amazon.fr",
+    "APJ6JRA9NG5V4":  "IT — amazon.it",
+    "A1RKKUPIHCS9HS": "ES — amazon.es",
+    "A1805IZSGTT6HS": "NL — amazon.nl",
+    "A21TJRUUN4KGV":  "IN — amazon.in",
+    "A1VC38T7YXB528": "JP — amazon.co.jp",
+    "A39IBJ37TRP1C6": "AU — amazon.com.au",
+}
+CUSTOM_MP = "Інший (ввести вручну)"
+
+FIELD_LABEL = {
+    "SP_API_LWA_CLIENT_ID":     "LWA Client ID",
+    "SP_API_LWA_CLIENT_SECRET": "LWA Client Secret",
+    "SP_API_REFRESH_TOKEN":     "Refresh Token",
+    "SP_API_MARKETPLACE_ID":    "Marketplace ID",
+    "SP_API_ENDPOINT":          "Endpoint",
+}
+
+
+def mask(value, keep=4):
+    """Показати хвіст секрета, не розкриваючи його."""
+    if not value:
+        return "—"
+    return f"{'•' * 8}{value[-keep:]}" if len(value) > keep else "•" * len(value)
+
+
+def credentials_panel():
+    """Сайдбар з доступами. Повертає (cfg, fingerprint, sources)."""
+    env_cfg = {k: (os.environ.get(k) or "").strip() for k in REQUIRED_ENV}
+
+    with st.sidebar:
+        st.subheader("🔐 Доступи SP-API")
+
+        cfg = {k: st.session_state.get(f"cred_{k}", env_cfg[k]) for k in REQUIRED_ENV}
+        filled = [k for k in REQUIRED_ENV if cfg[k]]
+        if len(filled) == len(REQUIRED_ENV):
+            badge, text = "cred-ok", "готово до запиту"
+        elif filled:
+            badge, text = "cred-partial", f"заповнено {len(filled)} з {len(REQUIRED_ENV)}"
+        else:
+            badge, text = "cred-missing", "не заповнено"
+        st.markdown(
+            f'<span class="cred-badge {badge}">{text}</span>', unsafe_allow_html=True
+        )
+
+        from_env = [k for k in REQUIRED_ENV if env_cfg[k]]
+        if from_env:
+            st.markdown(
+                f'<div class="cred-source">З <code>.env</code> підхоплено: '
+                f'{len(from_env)} з {len(REQUIRED_ENV)}</div>',
+                unsafe_allow_html=True,
+            )
+
+        with st.expander("Змінити доступи", expanded=not filled):
+            st.text_input(
+                FIELD_LABEL["SP_API_LWA_CLIENT_ID"],
+                value=cfg["SP_API_LWA_CLIENT_ID"],
+                key="cred_SP_API_LWA_CLIENT_ID",
+                placeholder="amzn1.application-oa2-client....",
+            )
+            st.text_input(
+                FIELD_LABEL["SP_API_LWA_CLIENT_SECRET"],
+                value=cfg["SP_API_LWA_CLIENT_SECRET"],
+                key="cred_SP_API_LWA_CLIENT_SECRET",
+                type="password",
+            )
+            st.text_input(
+                FIELD_LABEL["SP_API_REFRESH_TOKEN"],
+                value=cfg["SP_API_REFRESH_TOKEN"],
+                key="cred_SP_API_REFRESH_TOKEN",
+                type="password",
+                placeholder="Atzr|....",
+            )
+
+            region_names = list(ENDPOINTS)
+            current_ep = cfg["SP_API_ENDPOINT"]
+            ep_index = next(
+                (i for i, n in enumerate(region_names) if ENDPOINTS[n] == current_ep), 0
+            )
+            region = st.selectbox("Регіон", region_names, index=ep_index, key="cred_region")
+
+            mp_options = list(MARKETPLACES) + [CUSTOM_MP]
+            current_mp = cfg["SP_API_MARKETPLACE_ID"]
+            mp_index = mp_options.index(current_mp) if current_mp in MARKETPLACES else (
+                len(mp_options) - 1 if current_mp else 0
+            )
+            mp_choice = st.selectbox(
+                "Маркетплейс",
+                mp_options,
+                index=mp_index,
+                format_func=lambda m: MARKETPLACES.get(m, m),
+                key="cred_marketplace_choice",
+            )
+            if mp_choice == CUSTOM_MP:
+                marketplace = st.text_input(
+                    FIELD_LABEL["SP_API_MARKETPLACE_ID"],
+                    value=current_mp if current_mp not in MARKETPLACES else "",
+                    key="cred_marketplace_custom",
+                    placeholder="ATVPDKIKX0DER",
+                ).strip()
+            else:
+                marketplace = mp_choice
+
+            st.caption(
+                "Введене тут живе тільки в цій сесії й на диск не пишеться. "
+                "Щоб зберегти назавжди — впиши у `.env` поруч з `app.py`."
+            )
+
+        cfg["SP_API_ENDPOINT"] = ENDPOINTS[region]
+        cfg["SP_API_MARKETPLACE_ID"] = marketplace
+        cfg = {k: (v or "").strip() for k, v in cfg.items()}
+
+        sources = {
+            k: ("панель" if cfg[k] and cfg[k] != env_cfg[k] else ".env" if env_cfg[k] else "—")
+            for k in REQUIRED_ENV
+        }
+
+        st.markdown("**Поточні значення**")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Поле": FIELD_LABEL[k],
+                        "Значення": cfg[k] if k in
+                        ("SP_API_MARKETPLACE_ID", "SP_API_ENDPOINT") else mask(cfg[k]),
+                        "Джерело": sources[k],
+                    }
+                    for k in REQUIRED_ENV
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        if st.button("Перевірити з'єднання", use_container_width=True):
+            missing_now = [FIELD_LABEL[k] for k in REQUIRED_ENV if not cfg[k]]
+            if missing_now:
+                st.error("Не заповнено: " + ", ".join(missing_now))
+            else:
+                try:
+                    token = get_access_token(cfg)
+                    st.success(f"LWA токен отримано ({mask(token, 6)})")
+                except Exception as e:
+                    st.error(f"{type(e).__name__}: {e}")
+
+    fingerprint = hashlib.sha256(
+        "|".join(cfg[k] for k in REQUIRED_ENV).encode("utf-8")
+    ).hexdigest()[:12]
+    return cfg, fingerprint
+
+
+CFG, CFG_FP = credentials_panel()
+
+missing_fields = [FIELD_LABEL[k] for k in REQUIRED_ENV if not CFG[k]]
+if missing_fields:
     st.error(
-        "Немає доступів SP-API у `.env`: **" + ", ".join(missing_env) + "**\n\n"
-        "Потрібні: SP_API_LWA_CLIENT_ID, SP_API_LWA_CLIENT_SECRET, "
-        "SP_API_REFRESH_TOKEN, SP_API_MARKETPLACE_ID, SP_API_ENDPOINT."
+        "Заповни доступи SP-API у панелі ліворуч: **" + ", ".join(missing_fields) + "**"
+    )
+    st.info(
+        "Або поклади їх у `.env` поруч з `app.py`:\n\n"
+        "```\nSP_API_LWA_CLIENT_ID=...\nSP_API_LWA_CLIENT_SECRET=...\n"
+        "SP_API_REFRESH_TOKEN=...\nSP_API_MARKETPLACE_ID=ATVPDKIKX0DER\n"
+        "SP_API_ENDPOINT=https://sellingpartnerapi-na.amazon.com\n```"
     )
     st.stop()
-
-CFG = {k: os.environ[k] for k in REQUIRED_ENV}
 
 # ── 1. Вибір дат ───────────────────────────────────────────────────────────────
 today = dt.date.today()
@@ -88,13 +279,17 @@ if with_refunds and (today - end).days < lag:
 
 
 # ── 2. Завантаження з API (кеш по діапазону дат) ───────────────────────────────
+# cfg_fp у сигнатурі — щоб зміна доступів скидала кеш; самі секрети в ключ кешу
+# не потрапляють
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_returns(start_s, end_s):
+def load_returns(start_s, end_s, cfg_fp):
     return fetch_customer_returns(CFG, start_s, end_s)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_refunds(start_s, end_s, lag_days):
+def load_refunds(start_s, end_s, lag_days, cfg_fp):
     # ~100 подій на сторінку, 0.5 запиту/с — за квартал це кілька хвилин,
     # тому показуємо лічильник сторінок
     placeholder = st.empty()
@@ -121,7 +316,7 @@ start_s, end_s = start.isoformat(), end.isoformat()
 with st.status("Звіт повернень (SP-API Reports)...", expanded=True) as status:
     st.write("Створення й очікування звіту GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA")
     try:
-        raw = load_returns(start_s, end_s)
+        raw = load_returns(start_s, end_s, CFG_FP)
     except Exception as e:
         status.update(label="Помилка звіту повернень", state="error")
         st.error(f"{type(e).__name__}: {e}")
@@ -139,7 +334,7 @@ n_refund_added, skipped_skus = 0, []
 if with_refunds:
     with st.status("Refund-и (Finances API)...", expanded=True) as status:
         try:
-            ref = load_refunds(start_s, end_s, lag)
+            ref = load_refunds(start_s, end_s, lag, CFG_FP)
         except Exception as e:
             status.update(label="Помилка Finances API", state="error")
             st.error(f"{type(e).__name__}: {e}")

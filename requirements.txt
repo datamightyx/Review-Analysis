@@ -11,3 +11,5 @@ PyYAML>=6.0
 altair
 model2vec>=0.8   # semantic candidate hints (pure numpy; optional at runtime)
 boto3>=1.34      # Cloudflare R2 sync (S3-compatible); optional, only used if [r2] secrets are set
+requests>=2.31   # sp_api_refunds_check.py — raw SP-API REST calls
+python-dotenv>=1.0  # sp_api_refunds_check.py — load .env credentials

@@ -13,8 +13,10 @@ review-scoring/.calibrate_cache.json
 *.db-shm
 
 # real business data — keep locally, never commit
-MIGHTY X.xlsx
-MIGHTY X - Returns Analysis.xlsx
+*.xlsx
+*.csv
+*.tsv
+
 
 # python
 __pycache__/

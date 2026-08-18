@@ -1,4 +1,6 @@
 import io
+import re
+
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
@@ -9,13 +11,84 @@ st.set_page_config(page_title="Returns Analysis", page_icon="📦", layout="wide
 st.title("📦 Returns Analysis")
 st.markdown("---")
 
+# Звіт по поверненнях містить лише юніти, які фізично приїхали на FC і були
+# відскановані. Refunds (Business Reports / Unified Transaction) рахують
+# повернені гроші й додатково включають returnless refunds, товар, який покупець
+# не відправив назад, та повернення ще в дорозі. Тому refunds >= returns.
+# Другий (необов'язковий) файл — Unified Transaction — дозволяє додати refund-и
+# без фізичного повернення, щоб підсумки збігалися з цифрою refunds.
+REFUND_NO_RETURN   = 'REFUND_NO_RETURN'
+STATUS_REFUND_ONLY = 'Refund - No Return'
+RECON_KEY_COLS     = ['order-id', 'sku']
+
+
+def load_refund_only_rows(tx_file, returns_df):
+    """Refund-події з Unified Transaction CSV, яким немає пари в поверненнях."""
+    raw = tx_file.getvalue() if hasattr(tx_file, 'getvalue') else tx_file.read()
+    for enc in ('utf-8', 'utf-8-sig', 'cp1252', 'latin-1'):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode('utf-8', errors='replace')
+
+    # зріз по сирому тексту, не splitlines(): рядки даних містять поля в лапках
+    # з переносами всередині
+    m = re.search(r'^"?date/time"?\s*,', text, re.IGNORECASE | re.MULTILINE)
+    if m is None:
+        raise ValueError("не знайдено рядок заголовка 'date/time'")
+
+    tx = pd.read_csv(io.StringIO(text[m.start():]), dtype=str)
+    tx.columns = [c.strip() for c in tx.columns]
+    for col in ('type', 'order id', 'sku', 'quantity', 'date/time'):
+        if col not in tx.columns:
+            raise ValueError(f"у файлі транзакцій немає колонки '{col}'")
+
+    tx['quantity'] = pd.to_numeric(tx['quantity'], errors='coerce').fillna(0)
+    ref = tx[tx['type'].astype(str).str.strip().str.lower() == 'refund'].copy()
+    ref = ref[ref['quantity'] > 0]  # quantity 0 == рядок лише з комісією/податком
+    ref['dt'] = pd.to_datetime(
+        ref['date/time'].str.replace(r'\s+P[DS]T$', '', regex=True),
+        format='%b %d, %Y %I:%M:%S %p',
+        errors='coerce',
+    )
+
+    sku_asin = (
+        returns_df.dropna(subset=['sku', 'asin'])
+        .groupby('sku')['asin'].agg(lambda s: s.value_counts().index[0]).to_dict()
+    )
+    sku_name = (
+        returns_df.dropna(subset=['sku', 'product-name'])
+        .groupby('sku')['product-name'].first().to_dict()
+    )
+
+    ret_keys = set(zip(returns_df['order-id'], returns_df['sku']))
+    ref = ref[[(o, s) not in ret_keys for o, s in zip(ref['order id'], ref['sku'])]]
+
+    skipped = sorted(ref[~ref['sku'].isin(sku_asin)]['sku'].dropna().unique().tolist())
+    ref = ref[ref['sku'].isin(sku_asin)]
+
+    extra = pd.DataFrame({
+        'return-date':       ref['dt'].values,
+        'order-id':          ref['order id'].values,
+        'sku':               ref['sku'].values,
+        'asin':              ref['sku'].map(sku_asin).values,
+        'product-name':      ref['sku'].map(sku_name).values,
+        'quantity':          ref['quantity'].values,
+        'reason':            REFUND_NO_RETURN,
+        'customer-comments': pd.NA,
+    })
+    return extra, skipped
+
 # ── 0. Template download ───────────────────────────────────────────────────────
 def build_template() -> bytes:
     wb_t = Workbook()
     ws_t = wb_t.active
     ws_t.title = 'ALL'
     headers = [
-        'return-date', 'asin', 'product-name', 'quantity',
+        'return-date', 'order-id', 'sku', 'asin', 'product-name', 'quantity',
         'reason', 'customer-comments',
     ]
     ws_t.append(headers)
@@ -29,13 +102,14 @@ def build_template() -> bytes:
         cell.font      = hdr_font
         cell.alignment = Alignment(horizontal='center', vertical='center')
         cell.border    = brd
-    col_widths = [18, 14, 50, 8, 30, 60]
+    col_widths = [18, 22, 22, 14, 50, 8, 30, 60]
     for i, w in enumerate(col_widths, 1):
         ws_t.column_dimensions[get_column_letter(i)].width = w
     ws_t.row_dimensions[1].height = 18
     # example row
     ws_t.append([
-        '2024-01-15', 'B0XXXXXXXXX', 'Example Product Name', 1,
+        '2024-01-15', '111-0000000-0000000', 'SKU-FBA',
+        'B0XXXXXXXXX', 'Example Product Name', 1,
         'DEFECTIVE', 'The item stopped working after two days.',
     ])
     buf = io.BytesIO()
@@ -46,12 +120,16 @@ def build_template() -> bytes:
 with st.expander("Шаблон файлу (.xlsx)", expanded=False):
     st.markdown(
         "Файл повинен містити аркуш **`ALL`** з колонками нижче. "
-        "Поля **`return-date`** та **`quantity`** — необов'язкові."
+        "Поля **`return-date`** та **`quantity`** — необов'язкові. "
+        "**`order-id`** і **`sku`** потрібні лише для звірки з refunds "
+        "(другий файл — Unified Transaction)."
     )
     st.table(pd.DataFrame({
-        'Колонка':        ['return-date', 'asin', 'product-name', 'quantity', 'reason', 'customer-comments'],
-        'Обов\'язкова':   ['Ні', 'Так', 'Так', 'Ні', 'Так', 'Так'],
-        'Приклад':        ['2024-01-15', 'B0XXXXXXXXX', 'Example Product', '1', 'DEFECTIVE', 'Stopped working'],
+        'Колонка': ['return-date', 'order-id', 'sku', 'asin', 'product-name',
+                    'quantity', 'reason', 'customer-comments'],
+        'Обов\'язкова': ['Ні', 'Для звірки', 'Для звірки', 'Так', 'Так', 'Ні', 'Так', 'Так'],
+        'Приклад': ['2024-01-15', '111-0000000-0000000', 'SKU-FBA', 'B0XXXXXXXXX',
+                    'Example Product', '1', 'DEFECTIVE', 'Stopped working'],
     }))
     st.download_button(
         label="Завантажити шаблон",
@@ -64,6 +142,11 @@ st.markdown("---")
 
 # ── 1. File upload ────────────────────────────────────────────────────────────
 uploaded = st.file_uploader("Завантажте файл з поверненнями (.xlsx)", type=["xlsx"])
+
+uploaded_tx = st.file_uploader(
+    "Необов'язково: Unified Transaction report (.csv) — щоб додати refund-и без фізичного повернення",
+    type=["csv"],
+)
 
 if not uploaded:
     st.info("Завантажте файл, щоб продовжити.")
@@ -96,6 +179,14 @@ else:
 if 'quantity' not in df_all.columns:
     df_all['quantity'] = None
 
+recon_ready = all(c in df_all.columns for c in RECON_KEY_COLS)
+if uploaded_tx and not recon_ready:
+    st.warning(
+        f"Звірку з refunds пропущено: у файлі повернень немає колонок "
+        f"**{[c for c in RECON_KEY_COLS if c not in df_all.columns]}**. "
+        "Вони потрібні для join з транзакціями."
+    )
+
 all_asins = sorted(df_all['asin'].dropna().unique().tolist())
 
 st.subheader("Оберіть ASIN для аналізу")
@@ -125,6 +216,17 @@ if not st.button("▶ Аналізувати", type="primary"):
 
 with st.spinner("Аналіз..."):
     df = df_all[df_all['asin'].isin(selected_asins)].copy()
+
+    n_refund_added, skipped_skus = 0, []
+    if uploaded_tx and recon_ready:
+        try:
+            extra, skipped_skus = load_refund_only_rows(uploaded_tx, df_all)
+            extra = extra[extra['asin'].isin(selected_asins)]
+            n_refund_added = len(extra)
+            df = pd.concat([df, extra], ignore_index=True)
+        except Exception as e:
+            st.error(f"Не вдалося прочитати файл транзакцій: {e}")
+            st.stop()
 
     # ── Keyword sets ──────────────────────────────────────────────────────────
     KW = {
@@ -234,6 +336,8 @@ with st.spinner("Аналіз..."):
 
     def get_status(row):
         topic = row['comment_topic']
+        if row['reason'] == REFUND_NO_RETURN:
+            return STATUS_REFUND_ONLY
         if topic == 'NO_COMMENT':
             return 'No Comment'
         if topic == 'OTHER':
@@ -260,11 +364,14 @@ with st.spinner("Аналіз..."):
     C_SUMMARY_H = '2E75B6'
     C_ALT_ROW   = 'EEF3FA'
 
+    C_REFUNDONLY = 'E4DFEC'
+
     STATUS_FILL = {
-        'Mismatch':   PatternFill('solid', fgColor=C_MISMATCH),
-        'Match':      PatternFill('solid', fgColor=C_MATCH),
-        'Unclear':    PatternFill('solid', fgColor=C_UNCLEAR),
-        'No Comment': PatternFill('solid', fgColor=C_NOCOMMENT),
+        'Mismatch':         PatternFill('solid', fgColor=C_MISMATCH),
+        'Match':            PatternFill('solid', fgColor=C_MATCH),
+        'Unclear':          PatternFill('solid', fgColor=C_UNCLEAR),
+        'No Comment':       PatternFill('solid', fgColor=C_NOCOMMENT),
+        STATUS_REFUND_ONLY: PatternFill('solid', fgColor=C_REFUNDONLY),
     }
 
     header_font  = Font(name='Calibri', bold=True, color=C_HEADER_FG, size=10)
@@ -321,7 +428,8 @@ with st.spinner("Аналіз..."):
     def write_analysis_block(ws, grp, start_row):
         n_total     = len(grp)
         n_noc       = (grp['status'] == 'No Comment').sum()
-        n_commented = n_total - n_noc
+        n_refonly   = (grp['status'] == STATUS_REFUND_ONLY).sum()
+        n_commented = n_total - n_noc - n_refonly
         n_mismatch  = (grp['status'] == 'Mismatch').sum()
 
         topic_vc = (
@@ -474,8 +582,9 @@ with st.spinner("Аналіз..."):
     wb = Workbook()
 
     summary_cols = [
-        'ASIN', 'Product Name', 'Total Returns', 'Returns with Comment',
-        'Match', 'Mismatch', 'Unclear', 'No Comment',
+        'ASIN', 'Product Name', 'Total Cases (Returns + Refunds)', 'Physical Returns',
+        'Returns with Comment',
+        'Match', 'Mismatch', 'Unclear', 'No Comment', 'Refund w/o Return',
         'Mismatch %',
         'Top True Reason (Mismatch)',
         '2nd True Reason (Mismatch)',
@@ -491,11 +600,13 @@ with st.spinner("Аналіз..."):
         pname       = grp['product-name'].iloc[0]
         pname_short = pname[:80] + '...' if len(pname) > 80 else pname
         n_total     = len(grp)
-        n_comment   = (grp['status'] != 'No Comment').sum()
+        n_refonly   = (grp['status'] == STATUS_REFUND_ONLY).sum()
+        n_returns   = n_total - n_refonly
+        n_noc       = (grp['status'] == 'No Comment').sum()
+        n_comment   = n_returns - n_noc
         n_match     = (grp['status'] == 'Match').sum()
         n_mis       = (grp['status'] == 'Mismatch').sum()
         n_unc       = (grp['status'] == 'Unclear').sum()
-        n_noc       = (grp['status'] == 'No Comment').sum()
         mis_pct     = round(n_mis / n_comment * 100, 1) if n_comment > 0 else 0
 
         top_reasons = (
@@ -505,13 +616,15 @@ with st.spinner("Аналіз..."):
         top_reasons += [''] * (3 - len(top_reasons))
 
         ws_sum.append([
-            asin, pname_short, n_total, n_comment,
-            n_match, n_mis, n_unc, n_noc, mis_pct,
+            asin, pname_short, n_total, n_returns, n_comment,
+            n_match, n_mis, n_unc, n_noc, n_refonly, mis_pct,
             top_reasons[0], top_reasons[1], top_reasons[2],
         ])
 
+    MIS_PCT_COL, MIS_CNT_COL = 11, 7
+
     for row_idx in range(2, ws_sum.max_row + 1):
-        mis_pct  = ws_sum.cell(row_idx, 9).value or 0
+        mis_pct  = ws_sum.cell(row_idx, MIS_PCT_COL).value or 0
         row_fill = PatternFill('solid', fgColor='FFE0E0' if mis_pct >= 20 else
                                ('FFF3CC' if mis_pct >= 10 else 'F0F7F0'))
         for c in range(1, len(summary_cols) + 1):
@@ -519,15 +632,16 @@ with st.spinner("Аналіз..."):
             cell.font   = body_font
             cell.border = border
             cell.alignment = center_align if c != 2 else left_align
-            if c == 9:
+            if c == MIS_PCT_COL:
                 cell.number_format = '0.0"%"'
             cell.fill = (
-                PatternFill('solid', fgColor='FF9999') if c == 6 and mis_pct >= 20 else
-                PatternFill('solid', fgColor=C_UNCLEAR) if c == 6 and mis_pct >= 10 else
+                PatternFill('solid', fgColor='FF9999') if c == MIS_CNT_COL and mis_pct >= 20 else
+                PatternFill('solid', fgColor=C_UNCLEAR) if c == MIS_CNT_COL and mis_pct >= 10 else
+                PatternFill('solid', fgColor=C_REFUNDONLY) if c == 10 else
                 row_fill
             )
 
-    for i, w in enumerate([14, 60, 12, 16, 8, 10, 8, 12, 11, 24, 24, 24], 1):
+    for i, w in enumerate([14, 52, 16, 14, 16, 8, 10, 8, 12, 15, 11, 24, 24, 24], 1):
         ws_sum.column_dimensions[get_column_letter(i)].width = w
     ws_sum.freeze_panes = 'A2'
 
@@ -553,8 +667,10 @@ with st.spinner("Аналіз..."):
         pname = grp['product-name'].iloc[0]
 
         n_total   = len(grp)
+        n_refonly = (grp['status'] == STATUS_REFUND_ONLY).sum()
+        n_returns = n_total - n_refonly
         n_noc     = (grp['status'] == 'No Comment').sum()
-        n_comment = n_total - n_noc
+        n_comment = n_returns - n_noc
         n_match   = (grp['status'] == 'Match').sum()
         n_mis     = (grp['status'] == 'Mismatch').sum()
         n_unc     = (grp['status'] == 'Unclear').sum()
@@ -571,7 +687,8 @@ with st.spinner("Аналіз..."):
         ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=11)
         sc = ws.cell(2, 1)
         sc.value = (
-            f"Total Returns: {n_total}   |   With Comment: {n_comment}   |   "
+            f"Total Cases: {n_total}   |   Physical Returns: {n_returns}   |   "
+            f"Refund w/o Return: {n_refonly}   |   With Comment: {n_comment}   |   "
             f"Match: {n_match}   |   Mismatch: {n_mis} ({mis_pct}%)   |   "
             f"Unclear: {n_unc}   |   No Comment: {n_noc}"
         )
@@ -637,10 +754,23 @@ mis_pct = round(n_mis / n_clear * 100, 1) if n_clear else 0
 
 st.success("Аналіз завершено!")
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Всього рядків", len(df))
-col2.metric("Mismatch", n_mis)
-col3.metric("Mismatch %", f"{mis_pct}%")
+n_refonly_total = (df['status'] == STATUS_REFUND_ONLY).sum()
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Всього кейсів", len(df))
+col2.metric("Фізичні повернення", len(df) - n_refonly_total)
+col3.metric("Mismatch", n_mis)
+col4.metric("Mismatch %", f"{mis_pct}%")
+
+if n_refund_added:
+    st.info(
+        f"Додано **{n_refund_added}** refund-ів без фізичного повернення "
+        "(returnless refunds, товар не відправлено назад, або повернення ще в дорозі — "
+        "вікно повернення ~30 днів). Коментарів у них немає за визначенням, "
+        "тому mismatch-аналіз рахується лише по фізичних поверненнях."
+    )
+if skipped_skus:
+    st.caption(f"SKU без жодного повернення (пропущені при мапінгу на ASIN): {skipped_skus}")
 
 st.download_button(
     label="⬇ Завантажити результат (.xlsx)",

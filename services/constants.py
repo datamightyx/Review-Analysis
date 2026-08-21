@@ -190,6 +190,7 @@ REASON_OK = {
 # (e.g. POOR_FIT, PART_NOT_COMPATIBLE, EXCESSIVE_INSTALLATION) are left as the
 # raw code, same as sellerboard does for its own untranslated codes.
 REASON_LABEL = {
+    'REFUND_NO_RETURN': 'REFUND_NO_RETURN / Pending no reason',
     'UNWANTED_ITEM': 'Unwanted Item',
     'NOT_AS_DESCRIBED': 'Not as described on website',
     'MISORDERED': 'I accidentally ordered the wrong item',

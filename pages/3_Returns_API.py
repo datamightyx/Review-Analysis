@@ -2,7 +2,13 @@
 
 Два джерела, обидва з API:
   * GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA — фізичні повернення з коментарями
-  * /finances/v0/financialEvents (RefundEventList) — refund-и (повернені гроші)
+    та фізичним вердиктом складу (detailed-disposition)
+  * /finances/v0/financialEvents — гроші, повернені покупцю: RefundEventList,
+    GuaranteeClaimEventList (A-to-Z) і ChargebackEventList
+
+Звіряння йде по юнітах, а не по факту збігу ключа: для кожної пари
+(order-id, SKU) фізично повернуті штуки віднімаються від повернутих грошима,
+і в звіт іде лише додатний залишок.
 
 Report type 1202 (GET_DATE_RANGE_FINANCIAL_TRANSACTION_DATA) для цього акаунта
 недоступний ("Request for report type 1202 is not allowed at this time"), тому

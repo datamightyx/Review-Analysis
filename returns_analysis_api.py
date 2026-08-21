@@ -74,12 +74,6 @@ def main():
         default=7,
         help="Days to pad end date for Finances API release lag (default: 7)",
     )
-    parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=3,
-        help="Max parallel workers for Finances API page fetching (default: 3)",
-    )
     args = parser.parse_args()
 
     # Load returns data
@@ -137,15 +131,15 @@ def main():
         cfg = get_config()
         print("Fetching refund events from Finances API...")
         ref = fetch_refund_events(
-            cfg, args.start, args.end, 
+            cfg, args.start, args.end,
             release_lag_days=args.release_lag,
-            max_workers=args.max_workers
         )
         print(f"Retrieved {len(ref)} refund events, {int(ref['quantity'].sum())} units")
         extra, skipped = refunds_to_return_rows(ref, df, verbose=True)
-        print(f"Adding {len(extra)} refunds with no matching physical return")
+        print(f"Adding {len(extra)} refunds with no matching physical return, "
+              f"{int(extra['quantity'].sum()) if len(extra) else 0} units")
         if skipped:
-            print(f"Skipped SKUs (no ASIN mapping): {skipped}")
+            print(f"SKUs with no ASIN mapping (kept under a placeholder ASIN): {skipped}")
         df = pd.concat([df, extra], ignore_index=True)
 
     print("Building analysis workbook...")

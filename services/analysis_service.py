@@ -13,6 +13,8 @@ from services.constants import (
     DEFAULT_RELEASE_LAG_DAYS,
     MAX_RELEASE_LAG_DAYS,
     CACHE_TTL_SECONDS,
+    REFUND_NO_RETURN,
+    ASIN_UNMAPPED,
 )
 from services.credentials import CredentialsManager, get_credentials_panel
 from services.data_loader import (
@@ -66,6 +68,12 @@ class AnalysisResult:
     n_refunds_added: int
     skipped_skus: List[str]
     workbook_bytes: bytes
+    units_total: int = 0
+    units_returned: int = 0
+    units_refund_only: int = 0
+    refund_amount: float = 0.0
+    n_late_release: int = 0
+    refund_sources: Optional[dict] = None
 
 
 class ReturnsAnalysisService:
@@ -141,8 +149,8 @@ class ReturnsAnalysisService:
         """Validate user inputs."""
         if start > end:
             raise ValidationError("Початок періоду пізніше за кінець.")
-        if (end - start).days > 180:
-            st.warning("Finances API віддає щонайбільше ~180 днів історії. Звузь діапазон.")
+        # Hard limit lives in validate_date_range so the UI and the CLI agree
+        validate_date_range(start.isoformat(), end.isoformat())
     
     def run_analysis(
         self,
@@ -177,7 +185,9 @@ class ReturnsAnalysisService:
         # Fetch refunds if enabled
         n_refund_added = 0
         skipped_skus = []
-        
+        refund_sources: dict = {}
+        n_late_release = 0
+
         if with_refunds:
             if progress_callback:
                 progress_callback("Завантаження refund-ів (Finances API)...", 50)
@@ -190,41 +200,104 @@ class ReturnsAnalysisService:
             if progress_callback:
                 progress_callback(f"Отримано {len(ref)} refund-позицій, {int(ref['quantity'].sum())} юнітів", 75)
             
+            if not ref.empty:
+                refund_sources = ref["source"].value_counts().to_dict()
+
             extra, skipped_skus = refunds_to_return_rows(ref, df, verbose=False)
             n_refund_added = len(extra)
+
+            # Rows released after the period end came in only because of the lag
+            # window. Adjacent periods will double-count them, so make them visible.
+            if n_refund_added:
+                # end is a date, so the cutoff is the end of that day, not midnight
+                end_of_period = pd.Timestamp(end) + pd.Timedelta(days=1)
+                n_late_release = int(
+                    (extra["return-date"] >= end_of_period).sum()
+                )
+
             df = pd.concat([df, extra], ignore_index=True)
-            
+
             if progress_callback:
                 progress_callback(f"Refund-и без повернення: {n_refund_added}", 90)
-        
+
         # Build workbook
         if progress_callback:
             progress_callback("Побудова звіту...", 95)
-        
+
         wb = build_workbook(df)
         workbook_bytes = workbook_to_bytes(wb)
-        
+
         n_returns = len(df) - n_refund_added
-        
+
+        units = pd.to_numeric(df["quantity"], errors="coerce").fillna(1)
+        refund_mask = df["reason"] == REFUND_NO_RETURN
+        units_refund_only = int(units[refund_mask].sum())
+        units_total = int(units.sum())
+        refund_amount = float(
+            abs(pd.to_numeric(df.get("refund-amount"), errors="coerce").fillna(0.0).sum())
+        )
+
         return AnalysisResult(
             df=df,
             n_returns=n_returns,
             n_refunds_added=n_refund_added,
             skipped_skus=skipped_skus,
             workbook_bytes=workbook_bytes,
+            units_total=units_total,
+            units_returned=units_total - units_refund_only,
+            units_refund_only=units_refund_only,
+            refund_amount=refund_amount,
+            n_late_release=n_late_release,
+            refund_sources=refund_sources,
         )
     
     def render_results(self, result: AnalysisResult, start: date, end: date) -> None:
         """Render analysis results."""
         st.caption(f"Період: **{start} .. {end}** (UTC), {(end - start).days + 1} днів")
         
-        # Metrics
+        # Metrics — cases count rows, units count physical pieces
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Всього кейсів", len(result.df))
         c2.metric("Фізичні повернення", result.n_returns)
         c3.metric("Refund без повернення", result.n_refunds_added)
         c4.metric("ASIN", result.df["asin"].nunique())
-        
+
+        u1, u2, u3, u4 = st.columns(4)
+        u1.metric("Юнітів усього", result.units_total)
+        u2.metric("Юнітів повернуто", result.units_returned)
+        u3.metric("Юнітів без повернення", result.units_refund_only)
+        u4.metric("Сума refund-ів", f"{result.refund_amount:,.2f}")
+
+        st.caption(
+            "«Кейси» — це рядки, «юніти» — фізичні штуки. З unitsRefunded у "
+            "Business Reports порівнюй саме юніти."
+        )
+
+        if result.refund_sources:
+            st.caption(
+                "Джерела повернення грошей: "
+                + ", ".join(f"{k} — {v}" for k, v in result.refund_sources.items())
+            )
+
+        if result.n_late_release:
+            st.warning(
+                f"{result.n_late_release} refund-ів релізнуто вже після {end} — вони "
+                "потрапили сюди через запас на пізній реліз. При аналізі сусіднього "
+                "періоду вони порахуються ще раз."
+            )
+
+        # The sentinel is applied inside build_workbook's own copy, so raw NaN
+        # ASINs are still present here and must be counted too.
+        n_unmapped = int(
+            (result.df["asin"].isna() | (result.df["asin"] == ASIN_UNMAPPED)).sum()
+        )
+        if n_unmapped:
+            st.warning(
+                f"{n_unmapped} рядків не змаплені на ASIN (SKU нема у звіті повернень — "
+                f"типово FBM або товар без фізичних повернень за період). Вони в звіті "
+                f"під «{ASIN_UNMAPPED}», їхні юніти враховані."
+            )
+
         # Info messages
         if result.n_refunds_added:
             st.info(
@@ -236,7 +309,9 @@ class ReturnsAnalysisService:
         
         if result.skipped_skus:
             st.caption(
-                f"SKU без жодного повернення (не змаплені на ASIN, пропущені): {result.skipped_skus}"
+                "SKU без жодного фізичного повернення за період — ASIN підтягнути "
+                f"нема звідки, тому вони в звіті під «{ASIN_UNMAPPED}»: "
+                f"{result.skipped_skus}"
             )
         
         # Download button

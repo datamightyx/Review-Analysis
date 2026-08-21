@@ -21,8 +21,19 @@ from services.constants import (
     C_SUMMARY_H,
     C_ALT_ROW,
     C_REFUNDONLY,
+    C_UNCLEAR,
+    C_DISPO_BAD,
+    C_DISPO_OK,
     REFUND_NO_RETURN,
     STATUS_REFUND_ONLY,
+    ASIN_UNMAPPED,
+    PRODUCT_UNKNOWN,
+    DISPOSITION_DEFECTIVE,
+    DISPOSITION_SELLABLE,
+    DEFECT_CLAIM_REASONS,
+    DISPO_CONFIRMED,
+    DISPO_CONTRADICTED,
+    DISPO_NA,
 )
 
 
@@ -76,6 +87,47 @@ def get_true_reason(row: pd.Series) -> str:
     if row['status'] == 'Mismatch':
         return TRUE_REASON_LABEL.get(row['comment_topic'], row['reason'])
     return row['reason']
+
+
+def get_disposition_check(row: pd.Series) -> str:
+    """Cross-check a claimed defect against what the warehouse physically found.
+
+    detailed-disposition is Amazon's own grading of the returned unit, so unlike
+    the comment-vs-reason mismatch it is an independent signal: a customer who
+    claims DEFECTIVE on a unit graded SELLABLE is a different finding entirely.
+    Only defect-family claims are checkable; everything else returns blank.
+    """
+    if row['reason'] == REFUND_NO_RETURN:
+        return DISPO_NA
+    if str(row['reason']).strip().upper() not in DEFECT_CLAIM_REASONS:
+        return DISPO_NA
+    dispo = row.get('detailed-disposition')
+    if pd.isna(dispo):
+        return DISPO_NA
+    dispo = str(dispo).strip().upper()
+    if dispo in DISPOSITION_DEFECTIVE:
+        return DISPO_CONFIRMED
+    if dispo in DISPOSITION_SELLABLE:
+        return DISPO_CONTRADICTED
+    return DISPO_NA
+
+
+def _unique_sheet_title(wb: Workbook, base: Any) -> str:
+    """Build a legal, unique worksheet title.
+
+    Excel caps titles at 31 chars and forbids []:*?/\\, so unmapped-SKU
+    sentinels and long SKUs can collide once truncated.
+    """
+    title = str(base)[:31].strip() or 'UNKNOWN'
+    for ch in '[]:*?/\\':
+        title = title.replace(ch, '-')
+    if title not in wb.sheetnames:
+        return title
+    stem = title[:27]
+    i = 2
+    while f'{stem}~{i}' in wb.sheetnames:
+        i += 1
+    return f'{stem}~{i}'
 
 
 def pct_bar(pct: float, width: int = 8) -> str:
@@ -260,18 +312,41 @@ def write_analysis_block(ws, grp: pd.DataFrame, start_row: int) -> int:
 def build_workbook(df: pd.DataFrame) -> Workbook:
     """Build the analysis workbook from returns DataFrame."""
     df = df.copy()
+
+    # Rows with no ASIN would be silently dropped by groupby, taking their units
+    # with them. Park them under a visible sentinel instead.
+    for col in ('detailed-disposition', 'status', 'refund-amount', 'refund-source'):
+        if col not in df.columns:
+            df[col] = 0.0 if col == 'refund-amount' else pd.NA
+    df['asin'] = df['asin'].fillna(ASIN_UNMAPPED).replace('', ASIN_UNMAPPED)
+    df['product-name'] = df['product-name'].fillna(PRODUCT_UNKNOWN)
+
+    # Cases count rows; units count physical pieces. They are not the same number
+    # and the unit figure is the one comparable to Business Reports unitsRefunded.
+    df['units'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(1)
+    df['refund-amount'] = pd.to_numeric(df['refund-amount'], errors='coerce').fillna(0.0)
+
+    # The report's own status column (Reimbursed / Units returned to inventory) is
+    # kept before 'status' is reused for the analysis verdict.
+    df['status_raw'] = df['status']
+
     df['comment_topic'] = df['customer-comments'].apply(classify_comment)
     df['status'] = df.apply(get_status, axis=1)
     df['true_reason'] = df.apply(get_true_reason, axis=1)
+    df['dispo_check'] = df.apply(get_disposition_check, axis=1)
 
     wb = Workbook()
 
     # SUMMARY sheet
     summary_cols = [
-        'ASIN', 'Product Name', 'Total Cases (Returns + Refunds)', 'Physical Returns',
+        'ASIN', 'Product Name',
+        'Total Cases (Returns + Refunds)', 'Physical Returns',
+        'Units Total', 'Units Returned', 'Units Refund w/o Return',
         'Returns with Comment',
         'Match', 'Mismatch', 'Unclear', 'No Comment', 'Refund w/o Return',
         'Mismatch %',
+        'Defect Claims', 'Defect Confirmed', 'Defect Contradicted',
+        'Refund $ (no return)',
         'Top True Reason (Mismatch)',
         '2nd True Reason (Mismatch)',
         '3rd True Reason (Mismatch)',
@@ -283,10 +358,11 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
     style_header_row(ws_sum, 1, len(summary_cols), C_SUMMARY_H)
 
     for asin, grp in df.groupby('asin', sort=False):
-        pname = grp['product-name'].iloc[0]
+        pname = str(grp['product-name'].iloc[0])
         pname_short = pname[:80] + '...' if len(pname) > 80 else pname
         n_total = len(grp)
-        n_refonly = (grp['status'] == STATUS_REFUND_ONLY).sum()
+        refonly_mask = grp['status'] == STATUS_REFUND_ONLY
+        n_refonly = refonly_mask.sum()
         n_returns = n_total - n_refonly
         n_noc = (grp['status'] == 'No Comment').sum()
         n_comment = n_returns - n_noc
@@ -295,6 +371,15 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
         n_unc = (grp['status'] == 'Unclear').sum()
         mis_pct = round(n_mis / n_comment * 100, 1) if n_comment > 0 else 0
 
+        u_total = int(grp['units'].sum())
+        u_refonly = int(grp.loc[refonly_mask, 'units'].sum())
+        u_returns = u_total - u_refonly
+
+        n_claim = (grp['dispo_check'] != DISPO_NA).sum()
+        n_conf = (grp['dispo_check'] == DISPO_CONFIRMED).sum()
+        n_contra = (grp['dispo_check'] == DISPO_CONTRADICTED).sum()
+        refund_money = round(abs(grp.loc[refonly_mask, 'refund-amount'].sum()), 2)
+
         top_reasons = (
             grp[grp['status'] == 'Mismatch']['true_reason']
             .value_counts().head(3).index.tolist()
@@ -302,15 +387,24 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
         top_reasons += [''] * (3 - len(top_reasons))
 
         ws_sum.append([
-            asin, pname_short, n_total, n_returns, n_comment,
+            asin, pname_short, n_total, n_returns,
+            u_total, u_returns, u_refonly,
+            n_comment,
             n_match, n_mis, n_unc, n_noc, n_refonly, mis_pct,
+            n_claim, n_conf, n_contra, refund_money,
             top_reasons[0], top_reasons[1], top_reasons[2],
         ])
 
-    MIS_PCT_COL, MIS_CNT_COL = 11, 7
+    # Resolved by name so adding columns cannot silently shift the highlighting
+    MIS_PCT_COL = summary_cols.index('Mismatch %') + 1
+    MIS_CNT_COL = summary_cols.index('Mismatch') + 1
+    REFONLY_COL = summary_cols.index('Refund w/o Return') + 1
+    CONTRA_COL = summary_cols.index('Defect Contradicted') + 1
+    MONEY_COL = summary_cols.index('Refund $ (no return)') + 1
 
     for row_idx in range(2, ws_sum.max_row + 1):
         mis_pct = ws_sum.cell(row_idx, MIS_PCT_COL).value or 0
+        contra = ws_sum.cell(row_idx, CONTRA_COL).value or 0
         row_fill = PatternFill('solid', fgColor='FFE0E0' if mis_pct >= 20 else
                                ('FFF3CC' if mis_pct >= 10 else 'F0F7F0'))
         for c in range(1, len(summary_cols) + 1):
@@ -320,14 +414,21 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
             cell.alignment = center_align if c != 2 else left_align
             if c == MIS_PCT_COL:
                 cell.number_format = '0.0"%"'
+            if c == MONEY_COL:
+                cell.number_format = '#,##0.00'
             cell.fill = (
                 PatternFill('solid', fgColor='FF9999') if c == MIS_CNT_COL and mis_pct >= 20 else
                 PatternFill('solid', fgColor=C_UNCLEAR) if c == MIS_CNT_COL and mis_pct >= 10 else
-                PatternFill('solid', fgColor=C_REFUNDONLY) if c == 10 else
+                PatternFill('solid', fgColor=C_DISPO_BAD) if c == CONTRA_COL and contra else
+                PatternFill('solid', fgColor=C_REFUNDONLY) if c == REFONLY_COL else
                 row_fill
             )
 
-    for i, w in enumerate([14, 52, 16, 14, 16, 8, 10, 8, 12, 15, 11, 24, 24, 24], 1):
+    col_widths = [
+        14, 52, 16, 14, 11, 13, 18, 16, 8, 10, 8, 12, 15, 11,
+        12, 15, 17, 17, 24, 24, 24,
+    ]
+    for i, w in enumerate(col_widths, 1):
         ws_sum.column_dimensions[get_column_letter(i)].width = w
     ws_sum.freeze_panes = 'A2'
 
@@ -341,15 +442,18 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
         'Return Date', 'ASIN', 'Product Name', 'Qty',
         'Return Reason (Amazon)', 'Customer Comment',
         'Analysis Status', 'True Reason', 'Comment Topic',
+        'Disposition', 'Return Status', 'Defect Check', 'Refund $',
     ]
+    N_COLS = len(DISPLAY_HEADERS)
 
     for asin in asin_order:
         grp = df[df['asin'] == asin].sort_values('return-date', ascending=False).reset_index(drop=True)
-        ws = wb.create_sheet(title=str(asin)[:31])
-        pname = grp['product-name'].iloc[0]
+        ws = wb.create_sheet(title=_unique_sheet_title(wb, asin))
+        pname = str(grp['product-name'].iloc[0])
 
         n_total = len(grp)
-        n_refonly = (grp['status'] == STATUS_REFUND_ONLY).sum()
+        refonly_mask = grp['status'] == STATUS_REFUND_ONLY
+        n_refonly = refonly_mask.sum()
         n_returns = n_total - n_refonly
         n_noc = (grp['status'] == 'No Comment').sum()
         n_comment = n_returns - n_noc
@@ -358,7 +462,11 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
         n_unc = (grp['status'] == 'Unclear').sum()
         mis_pct = round(n_mis / n_comment * 100, 1) if n_comment > 0 else 0
 
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=11)
+        u_total = int(grp['units'].sum())
+        u_refonly = int(grp.loc[refonly_mask, 'units'].sum())
+        n_contra = (grp['dispo_check'] == DISPO_CONTRADICTED).sum()
+
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=N_COLS)
         tc = ws.cell(1, 1)
         tc.value = f"{asin}  |  {pname[:120]}"
         tc.font = Font(name='Calibri', bold=True, color='FFFFFF', size=11)
@@ -366,13 +474,16 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
         tc.alignment = Alignment(horizontal='left', vertical='center', indent=1)
         ws.row_dimensions[1].height = 22
 
-        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=11)
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=N_COLS)
         sc = ws.cell(2, 1)
         sc.value = (
             f"Total Cases: {n_total}   |   Physical Returns: {n_returns}   |   "
-            f"Refund w/o Return: {n_refonly}   |   With Comment: {n_comment}   |   "
+            f"Refund w/o Return: {n_refonly}   |   "
+            f"Units: {u_total} (refund-only {u_refonly})   |   "
+            f"With Comment: {n_comment}   |   "
             f"Match: {n_match}   |   Mismatch: {n_mis} ({mis_pct}%)   |   "
-            f"Unclear: {n_unc}   |   No Comment: {n_noc}"
+            f"Unclear: {n_unc}   |   No Comment: {n_noc}   |   "
+            f"Defect contradicted by disposition: {n_contra}"
         )
         sc.font = Font(name='Calibri', bold=True, size=9, color='1F3864')
         sc.fill = PatternFill('solid', fgColor='DCE6F1')
@@ -392,6 +503,7 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
         alt = False
         for row_num, (_, row) in enumerate(grp.iterrows(), data_start):
             alt = not alt
+            dispo_check = row['dispo_check']
             values = [
                 row['return-date'],
                 row['asin'],
@@ -402,6 +514,10 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
                 row['status'],
                 row['true_reason'],
                 row['comment_topic'],
+                '' if pd.isna(row['detailed-disposition']) else row['detailed-disposition'],
+                '' if pd.isna(row['status_raw']) else row['status_raw'],
+                dispo_check,
+                round(abs(row['refund-amount']), 2) or '',
             ]
             status = row['status']
             for c_idx, val in enumerate(values, 1):
@@ -414,15 +530,21 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
                     cell.fill = STATUS_FILL.get(status, PatternFill('solid', fgColor='FFFFFF'))
                 elif c_idx == 5 and status == 'Mismatch':
                     cell.fill = PatternFill('solid', fgColor='FFB3B3')
+                elif c_idx == 12 and dispo_check == DISPO_CONTRADICTED:
+                    cell.fill = PatternFill('solid', fgColor=C_DISPO_BAD)
+                elif c_idx == 12 and dispo_check == DISPO_CONFIRMED:
+                    cell.fill = PatternFill('solid', fgColor=C_DISPO_OK)
                 else:
                     cell.fill = PatternFill('solid', fgColor=C_ALT_ROW if alt else 'FFFFFF')
             ws.row_dimensions[row_num].height = 14
 
-        for ci, w in enumerate([20, 12, 50, 5, 25, 55, 14, 24, 25, 10, 25], 1):
+        detail_widths = [20, 12, 50, 5, 25, 55, 14, 24, 25, 20, 22, 26, 11]
+        for ci, w in enumerate(detail_widths, 1):
             ws.column_dimensions[get_column_letter(ci)].width = w
 
         for r in range(data_start, ws.max_row + 1):
             ws.cell(r, 1).number_format = 'YYYY-MM-DD HH:MM'
+            ws.cell(r, 13).number_format = '#,##0.00'
 
     return wb
 

@@ -74,6 +74,41 @@ CACHE_TTL_SECONDS = 3600
 REFUND_NO_RETURN = "REFUND_NO_RETURN"
 STATUS_REFUND_ONLY = "Refund - No Return"
 
+# Finances event lists that represent money back to the customer. All three are
+# ShipmentEvent-shaped (ShipmentItemAdjustmentList), so one parser handles them.
+# SAFETReimbursementEventList is deliberately excluded: it carries no SellerSKU
+# per item, so it cannot be attributed to an ASIN.
+MONEY_BACK_EVENT_LISTS = {
+    "RefundEventList": "Refund",
+    "GuaranteeClaimEventList": "A-to-Z Claim",
+    "ChargebackEventList": "Chargeback",
+}
+
+# Sentinels for rows that cannot be attributed, so they stay visible in the
+# report instead of being silently dropped by groupby.
+ASIN_UNMAPPED = "(no ASIN)"
+PRODUCT_UNKNOWN = "(unknown product)"
+
+# detailed-disposition values that physically confirm a bad unit
+DISPOSITION_DEFECTIVE = {
+    "DEFECTIVE", "CUSTOMER_DAMAGED", "DAMAGED", "CARRIER_DAMAGED",
+    "DISTRIBUTOR_DAMAGED", "WAREHOUSE_DAMAGED",
+}
+DISPOSITION_SELLABLE = {"SELLABLE"}
+
+# Stated reasons that assert a physical defect, checkable against disposition
+DEFECT_CLAIM_REASONS = {
+    "DEFECTIVE", "MISSING_PARTS", "DAMAGED_BY_FC",
+    "DAMAGED_BY_CARRIER", "QUALITY_UNACCEPTABLE",
+}
+
+DISPO_CONFIRMED = "Defect confirmed"
+DISPO_CONTRADICTED = "Claimed defect - unit sellable"
+DISPO_NA = ""
+
+C_DISPO_BAD = 'FFC7A0'
+C_DISPO_OK = 'D7F0D7'
+
 # Keyword dictionaries for comment classification
 KW = {
     'SIZE_TOO_LARGE': [

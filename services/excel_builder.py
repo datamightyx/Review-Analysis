@@ -11,6 +11,8 @@ from openpyxl.utils import get_column_letter
 from services.constants import (
     KW,
     REASON_OK,
+    REASON_LABEL,
+    reason_label,
     TRUE_REASON_LABEL,
     TRIVIAL,
     TOPIC_DISPLAY,
@@ -86,7 +88,7 @@ def get_true_reason(row: pd.Series) -> str:
     """Get corrected true reason based on comment analysis."""
     if row['status'] == 'Mismatch':
         return TRUE_REASON_LABEL.get(row['comment_topic'], row['reason'])
-    return row['reason']
+    return reason_label(row['reason'])
 
 
 def get_disposition_check(row: pd.Series) -> str:
@@ -167,7 +169,7 @@ def write_analysis_block(ws, grp: pd.DataFrame, start_row: int) -> int:
     if len(mis_grp) > 0:
         for stated, sub in mis_grp.groupby('reason'):
             mismatch_rows.append({
-                'stated': stated,
+                'stated': reason_label(stated),
                 'count': len(sub),
                 'top_true': sub['true_reason'].value_counts().index[0],
             })
@@ -509,7 +511,7 @@ def build_workbook(df: pd.DataFrame) -> Workbook:
                 row['asin'],
                 row['product-name'],
                 row['quantity'],
-                row['reason'],
+                reason_label(row['reason']),
                 row['customer-comments'] if not pd.isna(row['customer-comments']) else '',
                 row['status'],
                 row['true_reason'],

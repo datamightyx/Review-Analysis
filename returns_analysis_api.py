@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 from services import (
     REQUIRED_ENV,
+    DEFAULT_RELEASE_LAG_DAYS,
     get_access_token,
     fetch_customer_returns,
     parse_customer_returns,
@@ -71,8 +72,9 @@ def main():
     parser.add_argument(
         "--release-lag",
         type=int,
-        default=7,
-        help="Days to pad end date for Finances API release lag (default: 7)",
+        default=DEFAULT_RELEASE_LAG_DAYS,
+        help="Days to pad end date for Finances API release lag, to catch refunds "
+             f"posted after --end (default: {DEFAULT_RELEASE_LAG_DAYS}, strict period, no tail)",
     )
     args = parser.parse_args()
 

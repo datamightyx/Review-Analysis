@@ -44,6 +44,8 @@ __all__ = [
     "STATUS_REFUND_ONLY",
     "KW",
     "REASON_OK",
+    "REASON_LABEL",
+    "reason_label",
     "TRUE_REASON_LABEL",
     "TRIVIAL",
     "TOPIC_DISPLAY",

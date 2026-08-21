@@ -59,7 +59,7 @@ SECRET_PATHS = {
 # Date range constraints
 MAX_DATE_RANGE_DAYS = 180
 DEFAULT_DATE_RANGE_DAYS = 90
-DEFAULT_RELEASE_LAG_DAYS = 7
+DEFAULT_RELEASE_LAG_DAYS = 0
 MAX_RELEASE_LAG_DAYS = 14
 
 # Rate limiting
@@ -184,6 +184,46 @@ REASON_OK = {
     'EXCESSIVE_INSTALLATION': [],
     'UNAUTHORIZED_PURCHASE': [],
 }
+
+# Human-readable labels for Amazon's raw "reason" codes, matching the wording
+# sellerboard shows for its return-reason breakdown. Codes not in this dict
+# (e.g. POOR_FIT, PART_NOT_COMPATIBLE, EXCESSIVE_INSTALLATION) are left as the
+# raw code, same as sellerboard does for its own untranslated codes.
+REASON_LABEL = {
+    'UNWANTED_ITEM': 'Unwanted Item',
+    'NOT_AS_DESCRIBED': 'Not as described on website',
+    'MISORDERED': 'I accidentally ordered the wrong item',
+    'ORDERED_WRONG_ITEM': 'I accidentally ordered the wrong item',
+    'UNDELIVERABLE_UNKNOWN': 'Undeliverable; Unknown',
+    'UNDELIVERABLE_REFUSED': 'Undeliverable; Refused by customer',
+    'FOUND_BETTER_PRICE': 'I found better prices elsewhere',
+    'DEFECTIVE': 'Item is defective',
+    'MISSED_ESTIMATED_DELIVERY': "Item took too long to arrive; I don't want it anymore",
+    'NEVER_ARRIVED': 'Item never arrived',
+    'NOT_COMPATIBLE': 'Product is not compatible with my existing system',
+    'QUALITY_UNACCEPTABLE': 'Product performance/quality is not up to my expectations',
+    'SWITCHEROO': 'Amazon sent me the wrong item',
+    'UNAUTHORIZED_PURCHASE': 'Unauthorized purchase -- i.e. fraud',
+    'APPAREL_TOO_LARGE': 'Item too large',
+    'APPAREL_TOO_SMALL': 'Item too small',
+    'MISSING_PARTS': 'Item is missing parts',
+    'DAMAGED_BY_FC': 'Item damaged by Amazon fulfillment center',
+    'DAMAGED_BY_CARRIER': 'Item damaged by carrier',
+    'NO_REASON_GIVEN': 'No reason given',
+    'EXTRA_ITEM': 'Extra item, do not need',
+}
+
+
+def reason_label(code) -> str:
+    """Sellerboard-style human label for a raw Amazon reason code.
+
+    Falls back to the raw code untouched when there is no mapping, same as
+    sellerboard does for codes it hasn't translated (POOR_FIT, PART_NOT_COMPATIBLE,
+    EXCESSIVE_INSTALLATION).
+    """
+    key = str(code).strip().upper()
+    return REASON_LABEL.get(key, code)
+
 
 TRUE_REASON_LABEL = {
     'SIZE_TOO_LARGE': 'SIZE - Too Large',

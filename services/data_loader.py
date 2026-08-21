@@ -21,6 +21,7 @@ from services.constants import (
     MAX_DATE_RANGE_DAYS,
     MONEY_BACK_EVENT_LISTS,
     ASIN_UNMAPPED,
+    DEFAULT_RELEASE_LAG_DAYS,
 )
 
 # Columns the returns report must carry for reconciliation to work at all
@@ -252,7 +253,7 @@ def fetch_refund_events(
     cfg: Dict[str, str],
     start: str,
     end: str,
-    release_lag_days: int = 7,
+    release_lag_days: int = DEFAULT_RELEASE_LAG_DAYS,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> pd.DataFrame:
     """

@@ -461,10 +461,15 @@ def group_phrases(phrases: list[ExtractedPhrase], tax: Taxonomy, llm: LLM,
                   log: list | None = None,
                   double_check: bool = True,
                   audit: list | None = None,
-                  verify_llm: LLM | None = None) -> Taxonomy:
+                  verify_llm: LLM | None = None,
+                  checkpoint=None) -> Taxonomy:
+    """`checkpoint`, if given, is called (no args) after every applied batch
+    so a crash mid-pass loses at most one batch's worth of merges instead of
+    the whole pass — typically `lambda: db.save_taxonomy(tax)`."""
     return run_async(group_phrases_async(
         phrases, tax, llm, batch_size=batch_size, progress=progress, log=log,
-        double_check=double_check, audit=audit, verify_llm=verify_llm))
+        double_check=double_check, audit=audit, verify_llm=verify_llm,
+        checkpoint=checkpoint))
 
 
 async def group_phrases_async(phrases: list[ExtractedPhrase], tax: Taxonomy,
@@ -472,7 +477,8 @@ async def group_phrases_async(phrases: list[ExtractedPhrase], tax: Taxonomy,
                               log: list | None = None,
                               double_check: bool = True,
                               audit: list | None = None,
-                              verify_llm: LLM | None = None) -> Taxonomy:
+                              verify_llm: LLM | None = None,
+                              checkpoint=None) -> Taxonomy:
     """Categories never share groups, so each category runs as its own task
     and the tasks are gathered concurrently. WITHIN a category the batches
     stay sequential — every batch's prompt shows the taxonomy as mutated by
@@ -502,7 +508,7 @@ async def group_phrases_async(phrases: list[ExtractedPhrase], tax: Taxonomy,
     await asyncio.gather(*(
         _group_category(tax, category, cat_phrases, llm, verify_llm,
                         batch_size, progress, cat_logs[category],
-                        double_check, cat_audits[category])
+                        double_check, cat_audits[category], checkpoint)
         for category, cat_phrases in by_cat.items()))
 
     # merge the per-task journals back in deterministic (category) order
@@ -524,7 +530,7 @@ async def _group_category(tax: Taxonomy, category: str,
                           cat_phrases: list[ExtractedPhrase], llm: LLM,
                           verify_llm: LLM, batch_size: int, progress,
                           log: list | None, double_check: bool,
-                          audit: list | None) -> None:
+                          audit: list | None, checkpoint=None) -> None:
     uniques = _unique_phrases(cat_phrases)
     # deterministic pre-pass (exact matches + gate-certified merges) —
     # no judge call, identical inputs stay consistent and reruns cost
@@ -594,6 +600,11 @@ async def _group_category(tax: Taxonomy, category: str,
         done += len(batch)
         if progress:
             progress(category, done, len(uniques))
+        # durably persist structure after every applied batch — a crash
+        # (OOM kill, container restart, ...) loses at most this one batch
+        # instead of the whole pass; cheap relative to the LLM call above
+        if checkpoint:
+            checkpoint()
 
 
 def _renumber_new(tax: Taxonomy, preexisting: set[str], start: int,
@@ -1462,15 +1473,16 @@ decisions.
 
 def reassign_phrases(phrases: list[ExtractedPhrase], tax: Taxonomy, llm: LLM,
                      batch_size: int = 25, progress=None,
-                     audit: list | None = None) -> list[str]:
+                     audit: list | None = None, checkpoint=None) -> list[str]:
     return run_async(reassign_phrases_async(phrases, tax, llm, batch_size,
-                                            progress, audit))
+                                            progress, audit, checkpoint))
 
 
 async def reassign_phrases_async(phrases: list[ExtractedPhrase],
                                  tax: Taxonomy, llm: LLM,
                                  batch_size: int = 25, progress=None,
-                                 audit: list | None = None) -> list[str]:
+                                 audit: list | None = None,
+                                 checkpoint=None) -> list[str]:
     """Second grouping pass: replay the WHOLE corpus against the final,
     consolidated taxonomy. First-pass decisions for early batches were made
     against an immature taxonomy; here every phrase is placed with the full
@@ -1561,6 +1573,10 @@ async def reassign_phrases_async(phrases: list[ExtractedPhrase],
         for j, b in enumerate(batch):
             if j not in batch_canon:
                 _fallback_place(tax, category, b, audit)
+        # same rationale as the grouping pass: persist after every applied
+        # batch so a crash mid-application loses at most one batch
+        if checkpoint:
+            checkpoint()
 
     # rows whose variants were all re-judged elsewhere dissolve
     actions: list[str] = []

@@ -844,7 +844,8 @@ with tab_run:
                             min(d / max(t, 1), 1.0), text=f"{cat}: {d}/{t}"),
                         double_check=cfg.get("double_check", True),
                         audit=audit,
-                        verify_llm=llm_verify)
+                        verify_llm=llm_verify,
+                        checkpoint=lambda: db.save_taxonomy(tax))
 
                     if cfg.get("consolidate", True):
                         st.write("　консолідація таксономії…")
@@ -873,7 +874,8 @@ with tab_run:
                             batch_size=cfg.get("group_batch", 25),
                             progress=lambda cat, d, t: rbar.progress(
                                 min(d / max(t, 1), 1.0), text=f"{cat}: {d}/{t}"),
-                            audit=audit)
+                            audit=audit,
+                            checkpoint=lambda: db.save_taxonomy(tax))
                         for a in r_actions:
                             st.write(f"　· {a}")
 

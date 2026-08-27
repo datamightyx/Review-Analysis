@@ -331,7 +331,8 @@ def main() -> None:
                         progress=gprog,
                         double_check=cfg.get("double_check", True),
                         audit=audit,
-                        verify_llm=llm_verify)
+                        verify_llm=llm_verify,
+                        checkpoint=lambda: db.save_taxonomy(tax))
     print()
 
     # ---- 4b. consolidation pass over the whole taxonomy ----
@@ -365,7 +366,8 @@ def main() -> None:
                   end="\r")
         r_actions = reassign_phrases(phrases, tax, llm_reassign,
                                      batch_size=cfg.get("group_batch", 25),
-                                     progress=rprog, audit=audit)
+                                     progress=rprog, audit=audit,
+                                     checkpoint=lambda: db.save_taxonomy(tax))
         print()
         for a in r_actions:
             print(f"  {a}")

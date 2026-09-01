@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sys
+import zlib
 from datetime import date, datetime
 from pathlib import Path
 
@@ -39,7 +40,9 @@ from pipeline.extract import (extract_phrases, validate_verbatim,
 from pipeline.grouping import (group_phrases, apply_overrides, normalize,
                                reassign_phrases, reconcile_votes,
                                consolidate_taxonomy, merge_sibling_rows,
-                               split_groups)
+                               split_groups, prune_empty)
+from pipeline import manual_edits as me
+from components import taxonomy_board
 from pipeline.excel_writer import save_workbook
 from pipeline.quality import workbook_warnings
 from pipeline.llm import LLM, set_max_concurrency, ANTHROPIC_PRICING
@@ -388,6 +391,471 @@ def render_phrase_detail(tax: Taxonomy, c, all_products: list[str]) -> None:
                 unsafe_allow_html=True)
 
 
+# ------------------------------------------------------- USP board (tab «Дошка»)
+# Every board action mutates scoring.db AND records an overrides.json rule
+# (pipeline/manual_edits.py) — the fix shows up instantly and is replayed after
+# every future pipeline run.
+BOARD_UNDO = "board_undo"
+BOARD_UNDO_DEPTH = 8
+
+
+def board_payload(tax: Taxonomy, category: str, min_votes: int = 0,
+                  product: str | None = None,
+                  inspect: str | None = None) -> dict:
+    """Board data for one category: columns = USP groups, cards = rows."""
+    products = sorted({p for c in tax.canonicals.values() for p in c.votes})
+    groups = []
+    # picking a product means "show me this product's board": a row this product
+    # never voted for is noise, so the implicit floor is one vote
+    floor = max(min_votes, 1) if product else min_votes
+    for g in sorted(tax.groups_for(category), key=lambda g: -g.total(tax)):
+        all_rows = sorted(g.canonicals(tax), key=lambda c: -c.total)
+        rows = []
+        for c in all_rows:
+            shown = c.votes.get(product, 0) if product else c.total
+            if shown < floor:
+                continue
+            rows.append({"id": c.id, "text": c.text, "total": c.total,
+                         "votes": {p: n for p, n in c.votes.items() if n}})
+        # a group filtered down to nothing still gets a column — it has to stay
+        # a drop target, otherwise the filter hides where you want to drag TO
+        groups.append({"id": g.id, "name": g.name,
+                       "usage_category": g.usage_category,
+                       "total": g.total(tax), "rows": rows,
+                       "hidden": len(all_rows) - len(rows)})
+    # usage bands exist only on subbucket categories — the component hides the
+    # whole chip/menu elsewhere instead of offering a field Excel ignores
+    has_bucket = domain_mod.active().has_subbucket(category)
+    return {"products": products, "groups": groups, "inspect": inspect or "",
+            "product": product or "", "has_bucket": has_bucket,
+            "buckets": me.usage_buckets(tax, category) if has_bucket else []}
+
+
+def board_push_undo(tax: Taxonomy, ov: dict, label: str) -> None:
+    """Snapshot taxonomy AND overrides — an edit writes both, so undo has to
+    restore both. Compressed and depth-capped: this app has been OOM-killed on
+    a 1GB host before."""
+    blob = zlib.compress(json.dumps(
+        {"tax": me.taxonomy_to_dict(tax), "ov": ov},
+        ensure_ascii=False).encode("utf-8"))
+    stack = st.session_state.setdefault(BOARD_UNDO, [])
+    stack.append((label, blob))
+    del stack[:-BOARD_UNDO_DEPTH]
+
+
+def board_save(folder: Path, db, tax: Taxonomy, ov: dict) -> None:
+    reconcile_votes(tax)            # one review = one vote, on every write path
+    me.prune_overrides(ov)
+    db.save_taxonomy(tax)
+    save_overrides(folder, ov)      # uploads overrides.json itself
+    r2_sync.upload_file(folder / PRODUCT_DB_NAME, ROOT)
+
+
+def board_edit(folder: Path, db, label: str, op_fn, auto_merge: bool) -> None:
+    """Run one board operation against a freshly loaded taxonomy.
+
+    `op_fn(tax, ov)` must return (note, focus_group_ids, focus_row_ids). The
+    result goes to session_state["board_msg"]; the caller reruns."""
+    tax = db.load_taxonomy()
+    ov = load_overrides(folder)
+    board_push_undo(tax, ov, label)
+    try:
+        note, gids, rids = op_fn(tax, ov)
+    except me.EditError as e:
+        st.session_state[BOARD_UNDO].pop()
+        st.session_state["board_msg"] = {"error": str(e)}
+        return
+    auto_notes: list[str] = []
+    if auto_merge:
+        for gid in dict.fromkeys(gids):
+            auto_notes += me.auto_merge_group(tax, ov, gid,
+                                              focus_ids=list(rids) or None)
+    removed = [a for a in prune_empty(tax) if "порожню групу" in a]
+    board_save(folder, db, tax, ov)
+    st.session_state["board_msg"] = {
+        "note": note, "auto": auto_notes, "removed": removed,
+        "rows": [r for r in rids if r in tax.canonicals],
+        "group": gids[0] if gids else "",
+    }
+
+
+def board_undo(folder: Path, db) -> None:
+    stack = st.session_state.get(BOARD_UNDO) or []
+    if not stack:
+        return
+    label, blob = stack.pop()
+    state = json.loads(zlib.decompress(blob).decode("utf-8"))
+    tax = me.taxonomy_from_dict(state["tax"])
+    ov = state["ov"]
+    db.save_taxonomy(tax)
+    save_overrides(folder, ov)
+    r2_sync.upload_file(folder / PRODUCT_DB_NAME, ROOT)
+    st.session_state["board_msg"] = {"note": f"↩ Скасовано: {label}"}
+
+
+def clear_quote_selection(row_id: str) -> None:
+    """Checkbox keys are positional (row · product · index), so a `True` left
+    over after the picked quotes leave the row would silently select whatever
+    slid into their place — every quote action clears the whole selection."""
+    prefix = f"bd_qs_{row_id}_"
+    for k in [k for k in st.session_state if k.startswith(prefix)]:
+        st.session_state.pop(k, None)
+
+
+def board_quotes_panel(folder: Path, db, cat: str, c) -> None:
+    """What a board row is actually made of — the raw review quotes merged into
+    it. Same view as the «Фрази товару» tab, but for every product at once."""
+    counts = load_phrase_counts(folder)
+    # quote_sources pairs every review with the quote it actually said —
+    # complete, unlike the ≤3 samples in `quotes`. Rows saved before it
+    # existed fall back to the samples and cannot be moved.
+    movable: dict[str, list[dict]] = {}
+    for item in me.quote_rows(c):
+        movable.setdefault(item["product"], []).append(item)
+    # one stable checkbox key per card, built BEFORE the widgets: the action
+    # bar sits above them and reads the current selection out of
+    # session_state, where Streamlit keeps widget values between reruns
+    keys = {(p, i): f"bd_qs_{c.id}_{p}_{i}"
+            for p, items in movable.items() for i in range(len(items))}
+    checked = [(p, i) for (p, i), k in keys.items() if st.session_state.get(k)]
+    # the same wording can sit under several products; a move is row-wide, so
+    # the selection is a set of quote TEXTS, not of cards
+    picked = list(dict.fromkeys(movable[p][i]["quote"] for p, i in checked))
+
+    with st.container(border=True):
+        h1, h2 = st.columns([5, 1])
+        h1.markdown(f"**🔍 «{c.text}»** — {c.total} голос(ів)")
+        if h2.button("✕ Закрити", key="bd_ins_close", width="stretch"):
+            clear_quote_selection(c.id)
+            st.session_state.pop("board_inspect", None)
+            st.rerun()
+        st.caption("Сирі цитати з відгуків, злиті в цю фразу (×N — скільки "
+                   "відгуків так сказали, ⭐ — збігається з канонічним "
+                   "формулюванням). ↗ — винести цитату в іншу фразу або "
+                   "зробити з неї окремий рядок; голоси її відгуків підуть "
+                   "разом з нею. ☐ зліва — виділити кілька і зробити те саме "
+                   "гуртом (або прибрати їх з аналізу зовсім).")
+        if keys:
+            a1, a2, a3, a4, a5 = st.columns([1, 1, 1.7, 1.7, 1.6])
+            if a1.button("☑ Усі", key=f"bd_qall_{c.id}", width="stretch",
+                         disabled=len(checked) == len(keys)):
+                for k in keys.values():
+                    st.session_state[k] = True
+                st.rerun()
+            if a2.button("☐ Зняти", key=f"bd_qnone_{c.id}", width="stretch",
+                         disabled=not checked):
+                clear_quote_selection(c.id)
+                st.rerun()
+            n = len(picked)
+            if a3.button(f"↗ Перенести ({n})", key=f"bd_qmv_{c.id}",
+                         width="stretch", disabled=not n,
+                         help="В іншу фразу, окремими рядками або одним "
+                              "новим рядком"):
+                st.session_state["board_quote_move"] = {"row": c.id,
+                                                        "quotes": picked}
+                st.rerun()
+            if a4.button(f"🚫 Без USP ({n})", key=f"bd_qpark_{c.id}",
+                         width="stretch", disabled=not n,
+                         help=f"Кожна цитата — окремим рядком у групі "
+                              f"«{me.NO_USP_GROUP}» цієї категорії"):
+                board_edit(
+                    folder, db, f"винесення цитат без USP ({n})",
+                    lambda tax, ov: (
+                        me.move_quotes(tax, ov, c.id, picked,
+                                       group_name=me.NO_USP_GROUP,
+                                       each_own_row=True),
+                        [], []),
+                    False)   # never auto-merge: rows just split off would be
+                             # folded straight back by the gate that grouped them
+                clear_quote_selection(c.id)
+                st.rerun()
+            if a5.button(f"🗑 Прибрати ({n})", key=f"bd_qdrop_{c.id}",
+                         width="stretch", disabled=not n,
+                         help="Прибрати цитати з аналізу разом з їхніми "
+                              "голосами"):
+                st.session_state["board_quote_drop"] = {"row": c.id,
+                                                        "quotes": picked}
+                st.rerun()
+        for p, n in sorted(c.votes.items(), key=lambda kv: -kv[1]):
+            if not n:
+                continue
+            st.markdown(f"**{p}** — {n} голос(ів)")
+            if movable.get(p):
+                for i, item in enumerate(movable[p]):
+                    mark = (" ⭐" if normalize(item["quote"]) == normalize(c.text)
+                            else "")
+                    q0, q1, q2 = st.columns([0.5, 8.5, 1])
+                    q0.checkbox("Обрати цитату", key=keys[(p, i)],
+                                label_visibility="collapsed")
+                    q1.markdown(
+                        f'<div class="quote-card"><div class="quote-product">'
+                        f'×{item["votes"]}{mark}</div>'
+                        f'{html.escape(item["quote"])}</div>',
+                        unsafe_allow_html=True)
+                    if q2.button("↗", key=f"bd_mq_{c.id}_{p}_{i}",
+                                 help="Перенести цю цитату в іншу фразу "
+                                      "або в окремий рядок"):
+                        st.session_state["board_quote_move"] = {
+                            "row": c.id, "quotes": [item["quote"]]}
+                        st.rerun()
+                continue
+            variants = split_quote_variants(c.quotes.get(p, []))
+            if not variants:
+                st.caption("Сирі цитати для цього товару не збереглися.")
+                continue
+            covered = 0
+            for v in variants:
+                k = counts.get((cat, p, normalize(v)), 0)
+                covered += k or 1
+                mark = " ⭐" if normalize(v) == normalize(c.text) else ""
+                st.markdown(
+                    f'<div class="quote-card"><div class="quote-product">'
+                    f'×{k or "?"}{mark}</div>{html.escape(v)}</div>',
+                    unsafe_allow_html=True)
+            if covered < n:
+                st.caption(f"⚠️ Показані цитати покривають {covered} з {n} "
+                           f"голосів — решта варіантів не збереглася "
+                           f"(зберігається до 3 на злиття).")
+
+
+def quote_preview(quotes: list[str], limit: int = 5) -> None:
+    for q in quotes[:limit]:
+        st.markdown(f'<div class="quote-card">{html.escape(q)}</div>',
+                    unsafe_allow_html=True)
+    if len(quotes) > limit:
+        st.caption(f"…і ще {len(quotes) - limit} цитат(и).")
+
+
+@st.dialog("↗ Перенести цитати")
+def board_move_quotes_dialog(folder: Path, db, spec: dict):
+    """One quote (the ↗ on a card) or a whole selection — the same dialog; the
+    only difference is that a batch can also go each-into-its-own-row."""
+    tax = db.load_taxonomy()
+    src = tax.canonicals.get(spec["row"])
+    quotes = [q for q in spec.get("quotes", []) if q]
+    if src is None or not quotes:
+        st.warning("Рядка вже немає — оновіть сторінку.")
+        if st.button("Закрити", key="bd_mq_close"):
+            st.session_state.pop("board_quote_move", None)
+            st.rerun()
+        return
+    cat = me.category_of(tax, src)
+    n = len(quotes)
+    quote_preview(quotes)
+    st.caption(("Зараз ця цитата рахується" if n == 1
+                else f"Зараз ці {n} цитат(и) рахуються")
+               + f" в рядку «{src.text}». Голоси відгуків, які сказали саме "
+                 + ("її" if n == 1 else "їх") + ", підуть за "
+                 + ("нею." if n == 1 else "ними."))
+    SAME = "🔗 В іншу фразу"
+    OWN = "🆕 Залишити окремим рядком" if n == 1 else "🆕 Окремими рядками"
+    JOINT = "🧩 Усі в один новий рядок"
+    PARK = f"🚫 Без USP (група «{me.NO_USP_GROUP}»)"
+    modes = [SAME, OWN] + ([JOINT] if n > 1 else []) + [PARK]
+    mode = st.radio("Куди перенести?", modes, key=f"bd_mq_mode_{n > 1}")
+    target_id = new_text = group_id = None
+    group_name, each_own = "", False
+    if mode == SAME:
+        others = sorted((c for c in tax.canonicals.values()
+                         if c.id != src.id and me.category_of(tax, c) == cat),
+                        key=lambda c: -c.total)
+        if not others:
+            st.warning("У цій категорії немає інших фраз.")
+        else:
+            def _label(cid: str) -> str:
+                c = tax.canonicals[cid]
+                g = tax.groups.get(c.group_id)
+                return f"{g.name if g else '?'} · {c.text} (Σ{c.total})"
+            target_id = st.selectbox("Фраза, у яку перенести",
+                                     [c.id for c in others],
+                                     format_func=_label, key="bd_mq_to")
+    elif mode == PARK:
+        each_own, group_name = True, me.NO_USP_GROUP
+        st.caption(f"Кожна цитата стане окремим рядком у групі "
+                   f"«{me.NO_USP_GROUP}» цієї категорії (створимо її, якщо "
+                   "ще немає). В Excel ця група пишеться як звичайна USP — "
+                   "просто ці голоси більше не додаються до реальних USP.")
+    else:
+        # one quote always gets an editable wording; a batch keeps each quote
+        # verbatim unless the user asked for one joint row
+        if mode == JOINT or n == 1:
+            new_text = st.text_input("Формулювання нового рядка",
+                                     value=quotes[0][:120], key="bd_mq_text")
+        else:
+            each_own = True
+            st.caption("Кожна цитата стане окремим рядком зі своїм "
+                       "формулюванням.")
+        groups = sorted(tax.groups_for(cat), key=lambda g: -g.total(tax))
+        ids = [g.id for g in groups]
+        cur = ids.index(src.group_id) if src.group_id in ids else 0
+        group_id = st.selectbox(
+            "USP для нових рядків", ids, index=cur,
+            format_func=lambda i: tax.groups[i].name, key="bd_mq_grp")
+    c1, c2 = st.columns(2)
+    ok = c1.button("↗ Перенести", type="primary", width="stretch",
+                   key="bd_mq_ok", disabled=mode == SAME and not target_id)
+    if ok:
+        label = (f"перенесення цитати «{quotes[0][:40]}»" if n == 1
+                 else f"перенесення цитат ({n})")
+        board_edit(
+            folder, db, label,
+            lambda tax, ov: (
+                me.move_quotes(tax, ov, spec["row"], quotes,
+                               target_row_id=target_id, new_text=new_text,
+                               group_id=group_id, group_name=group_name,
+                               each_own_row=each_own),
+                [], []),
+            False)   # never auto-merge here: a row just split off would be
+                     # folded straight back by the gate that grouped it
+        clear_quote_selection(spec["row"])
+        st.session_state.pop("board_quote_move", None)
+        st.rerun()
+    if c2.button("Скасувати", width="stretch", key="bd_mq_cancel"):
+        st.session_state.pop("board_quote_move", None)
+        st.rerun()
+
+
+@st.dialog("🗑 Прибрати цитати")
+def board_drop_quotes_dialog(folder: Path, db, spec: dict):
+    tax = db.load_taxonomy()
+    src = tax.canonicals.get(spec["row"])
+    quotes = [q for q in spec.get("quotes", []) if q]
+    if src is None or not quotes:
+        st.warning("Рядка вже немає — оновіть сторінку.")
+        if st.button("Закрити", key="bd_dq_close"):
+            st.session_state.pop("board_quote_drop", None)
+            st.rerun()
+        return
+    n = len(quotes)
+    quote_preview(quotes)
+    st.warning(f"Ці цитати ({n}) буде прибрано з аналізу: голоси відгуків, "
+               f"які сказали саме їх, зникнуть з рядка «{src.text}» і нікуди "
+               "не перейдуть. Відгук, чиї ІНШІ цитати лишаються в рядку, свій "
+               "голос зберігає. Правило запишеться в overrides.json, тож ці "
+               "цитати будуть прибрані й на наступних прогонах. Скасувати — "
+               "кнопкою ↩ над дошкою.")
+    c1, c2 = st.columns(2)
+    if c1.button("🗑 Прибрати", type="primary", width="stretch",
+                 key="bd_dq_ok"):
+        board_edit(
+            folder, db, f"прибирання цитат ({n})",
+            lambda tax, ov: (
+                me.drop_quotes(tax, ov, spec["row"], quotes), [], []),
+            False)
+        clear_quote_selection(spec["row"])
+        st.session_state.pop("board_quote_drop", None)
+        st.rerun()
+    if c2.button("Скасувати", width="stretch", key="bd_dq_cancel"):
+        st.session_state.pop("board_quote_drop", None)
+        st.rerun()
+
+
+def board_close_dialog() -> None:
+    st.session_state.pop("board_pending", None)
+
+
+@st.dialog("🔀 Злити USP")
+def board_merge_groups_dialog(folder: Path, db, op: dict, auto_merge: bool):
+    tax = db.load_taxonomy()
+    src, tgt = tax.groups.get(op["source"]), tax.groups.get(op["target"])
+    if src is None or tgt is None:
+        st.warning("Однієї з груп уже немає — оновіть сторінку.")
+        if st.button("Закрити", key="bd_mg_close"):
+            board_close_dialog()
+            st.rerun()
+        return
+    st.markdown(f"**«{src.name}»** ({src.total(tax)} гол.) вливається в "
+                f"**«{tgt.name}»** ({tgt.total(tax)} гол.)")
+    st.caption(f"Разом стане {len(src.canonicals(tax)) + len(tgt.canonicals(tax))} "
+               f"фраз · {src.total(tax) + tgt.total(tax)} голосів.")
+    options = [tgt.name] + ([src.name] if src.name != tgt.name else [])
+    CUSTOM = "✏️ Інша назва…"
+    pick = st.radio("Яку назву залишити?", options + [CUSTOM], key="bd_mg_pick")
+    name = pick
+    if pick == CUSTOM:
+        name = st.text_input("Нова назва USP", value=tgt.name, key="bd_mg_new")
+    c1, c2 = st.columns(2)
+    if c1.button("🔀 Злити", type="primary", width="stretch", key="bd_mg_ok"):
+        board_edit(
+            folder, db, f"злиття USP «{src.name}»+«{tgt.name}»",
+            lambda tax, ov: (
+                me.merge_groups(tax, ov, [op["source"]], op["target"],
+                                name=name),
+                [op["target"]], []),
+            auto_merge)
+        board_close_dialog()
+        st.rerun()
+    if c2.button("Скасувати", width="stretch", key="bd_mg_cancel"):
+        board_close_dialog()
+        st.rerun()
+
+
+@st.dialog("🔗 Злити фрази")
+def board_merge_rows_dialog(folder: Path, db, op: dict, auto_merge: bool):
+    tax = db.load_taxonomy()
+    keep = tax.canonicals.get(op["into"])
+    others = me.rows_by_id(tax, [r for r in op["rows"] if r != op["into"]])
+    if keep is None or not others:
+        st.warning("Рядків уже немає — оновіть сторінку.")
+        if st.button("Закрити", key="bd_mr_close"):
+            board_close_dialog()
+            st.rerun()
+        return
+    st.markdown("Ці формулювання стануть **одним рядком**; голоси "
+                "підсумуються (один відгук = один голос).")
+    for c in [keep] + others:
+        st.markdown(f'<div class="quote-card"><div class="quote-product">'
+                    f'{c.total} гол.</div>{html.escape(c.text)}</div>',
+                    unsafe_allow_html=True)
+    texts = list(dict.fromkeys([keep.text] + [c.text for c in others]))
+    final = st.radio("Яке формулювання залишити?", texts, key="bd_mr_pick")
+    c1, c2 = st.columns(2)
+    if c1.button("🔗 Злити", type="primary", width="stretch", key="bd_mr_ok"):
+        board_edit(
+            folder, db, f"злиття рядків у «{final}»",
+            lambda tax, ov: (
+                me.merge_rows(tax, ov, op["rows"], op["into"], keep_text=final),
+                [keep.group_id], [op["into"]]),
+            auto_merge)
+        board_close_dialog()
+        st.rerun()
+    if c2.button("Скасувати", width="stretch", key="bd_mr_cancel"):
+        board_close_dialog()
+        st.rerun()
+
+
+@st.dialog("➕ Нова USP")
+def board_new_group_dialog(folder: Path, db, op: dict, auto_merge: bool):
+    tax = db.load_taxonomy()
+    rows = me.rows_by_id(tax, op["rows"])
+    if not rows:
+        st.warning("Фраз уже немає — оновіть сторінку.")
+        if st.button("Закрити", key="bd_ng_close"):
+            board_close_dialog()
+            st.rerun()
+        return
+    st.caption("Фрази, що переїдуть у нову USP:")
+    for c in rows:
+        st.markdown(f"- «{c.text}» — {c.total} гол.")
+    name = st.text_input("Назва USP", value=rows[0].text[:60], key="bd_ng_name")
+    c1, c2 = st.columns(2)
+    if c1.button("➕ Створити", type="primary", width="stretch", key="bd_ng_ok"):
+        holder: dict = {}
+
+        def _op(tax, ov):
+            note = me.new_group_from_rows(tax, ov, op["rows"], name)
+            row = tax.canonicals.get(op["rows"][0])
+            holder["gid"] = row.group_id if row else ""
+            return note, [holder["gid"]], list(op["rows"])
+
+        board_edit(folder, db, f"нова USP «{name}»", _op, auto_merge)
+        board_close_dialog()
+        st.rerun()
+    if c2.button("Скасувати", width="stretch", key="bd_ng_cancel"):
+        board_close_dialog()
+        st.rerun()
+
+
 def load_usage_history() -> pd.DataFrame:
     """All logged pipeline runs across every product line, oldest first."""
     rows = root_db(ROOT).load_usage()
@@ -576,9 +1044,10 @@ h3.metric("USP-груп", stats["groups"] or "—")
 h4.metric("Останній Excel", stats["last_xlsx"] or "—")
 st.divider()
 
-tab_prod, tab_run, tab_res, tab_by_prod, tab_review, tab_fix, tab_cost = st.tabs(
-    ["📦 Продукти й PDF", "▶️ Запуск", "🗂 Результати", "🔎 Фрази товару",
-     "🕵 Перевірити", "✏️ Корекції", "💰 Витрати"])
+(tab_prod, tab_run, tab_res, tab_board, tab_by_prod, tab_review, tab_fix,
+ tab_cost) = st.tabs(
+    ["📦 Продукти й PDF", "▶️ Запуск", "🗂 Результати", "🧩 Дошка USP",
+     "🔎 Фрази товару", "🕵 Перевірити", "✏️ Корекції", "💰 Витрати"])
 
 
 # ---------------------------------------------------------------- products
@@ -1063,6 +1532,385 @@ with tab_res:
                                           "повні варіанти формулювання цієї фрази.")
 
 
+# ---------------------------------------------------------------- USP board
+with tab_board:
+    bd_db = taxonomy_db(folder)
+    if bd_db is None or not bd_db.has_taxonomy():
+        st.info("Ще немає таксономії — запустіть пайплайн на вкладці «Запуск».")
+    else:
+        tax = bd_db.load_taxonomy()
+        bd_cats = [c for c in domain_mod.active().ids() if tax.groups_for(c)]
+        if not bd_cats:
+            st.info("Таксономія порожня.")
+        else:
+            all_products = sorted({p for c in tax.canonicals.values()
+                                   for p in c.votes})
+            b1, bp, b2, b3, b4 = st.columns([2.4, 2, 1.2, 1.7, 1.5])
+            bd_cat = b1.selectbox("Категорія", bd_cats, format_func=cat_label,
+                                  key="bd_cat")
+            ALL_PROD = "— усі товари —"
+            bd_prod = bp.selectbox(
+                "Товар", [ALL_PROD] + all_products, key="bd_prod",
+                help="Показати лише ті фрази, за які голосував цей товар. "
+                     "Редагування діють на всю категорію, не лише на нього.")
+            bd_prod = None if bd_prod == ALL_PROD else bd_prod
+            bd_min = b2.number_input(
+                "Мін. голосів", min_value=0, max_value=99, value=0,
+                key="bd_min", help="Сховати рідкісні фрази, щоб дошка не рябіла")
+            bd_auto = b3.toggle(
+                "🤖 Автозлиття схожих", value=True, key="bd_auto",
+                help="Після кожного перетягування рядки, які детермінований "
+                     "гейт визнає тим самим повідомленням, зливаються самі "
+                     "(те саме правило, з яким пайплайн зливає без LLM). "
+                     "Решту схожих показано нижче як кандидатів.")
+            bd_stack = st.session_state.get(BOARD_UNDO) or []
+            if b4.button(f"↩ Скасувати ({len(bd_stack)})", key="bd_undo",
+                         width="stretch", disabled=not bd_stack,
+                         help=(f"Останнє: {bd_stack[-1][0]}" if bd_stack
+                               else "Немає що скасовувати")):
+                board_undo(folder, bd_db)
+                st.rerun()
+
+            bd_msg = st.session_state.pop("board_msg", None)
+            if bd_msg:
+                if bd_msg.get("error"):
+                    st.warning(bd_msg["error"])
+                else:
+                    st.success(bd_msg["note"])
+                    if bd_msg.get("auto"):
+                        st.caption("🤖 Автоматично злито: " +
+                                   " · ".join(bd_msg["auto"]))
+                    for line in bd_msg.get("removed", []):
+                        st.caption(f"🧹 {line}")
+                    st.session_state["board_last"] = bd_msg
+
+            # a pending drop waits for the user's choice (which name / which
+            # wording survives) before anything is written
+            bd_pending = st.session_state.get("board_pending")
+            if bd_pending:
+                if bd_pending["op"] == "merge_groups":
+                    board_merge_groups_dialog(folder, bd_db, bd_pending, bd_auto)
+                elif bd_pending["op"] == "merge_rows":
+                    board_merge_rows_dialog(folder, bd_db, bd_pending, bd_auto)
+                elif bd_pending["op"] == "new_group":
+                    board_new_group_dialog(folder, bd_db, bd_pending, bd_auto)
+
+            # raw quotes waiting to be re-homed or thrown out (from the 🔍
+            # panel below) — one dialog at a time
+            bd_qmove = st.session_state.get("board_quote_move")
+            bd_qdrop = st.session_state.get("board_quote_drop")
+            if bd_qmove:
+                board_move_quotes_dialog(folder, bd_db, bd_qmove)
+            elif bd_qdrop:
+                board_drop_quotes_dialog(folder, bd_db, bd_qdrop)
+
+            v1, v2, v3 = st.columns([3, 1.7, 1.1])
+            bd_view = v1.radio(
+                "Вигляд", ["🧩 Дошка (перетягування)", "📋 Результуюча таблиця"],
+                horizontal=True, label_visibility="collapsed", key="bd_view")
+            bd_height = v2.slider("Висота дошки", 420, 1200, 660, 40,
+                                  key="bd_h", label_visibility="collapsed",
+                                  disabled=bd_view.startswith("📋"))
+            # the full instructions live in one place, folded away: on screen
+            # they were a wall of text between the controls and the board
+            with v3.popover("❓ Як це працює", width="stretch"):
+                st.markdown(
+                    "**Найшвидший шлях — меню `⋯` на картці** (або права "
+                    "кнопка миші): перенести в іншу USP, злити з іншою "
+                    "фразою, зробити нову USP, показати сирі цитати, "
+                    "переписати формулювання. Те саме меню є в заголовку "
+                    "колонки — для дій з усією USP.\n\n"
+                    "**Перетягування** (те саме, але мишею):\n"
+                    "- картка **в іншу колонку** — фраза переїде в ту USP;\n"
+                    "- картка **на іншу картку** — рядки зіллються "
+                    "(спитаємо, яке формулювання лишити);\n"
+                    "- **заголовок на заголовок** — зіллються USP "
+                    "(спитаємо, яку назву лишити);\n"
+                    "- у зону **➕ Нова USP** — створиться нова група.\n"
+                    "Біля краю дошки вона прокручується сама — тягнути "
+                    "можна й у колонку, якої зараз не видно.\n\n"
+                    "**Масово:** клік по картці (або ☐) виділяє, "
+                    "**Shift+клік** — цілий діапазон, ☐ у заголовку — усю "
+                    "колонку. Над дошкою зʼявиться панель: перенести всі "
+                    "виділені в будь-яку USP, зробити з них нову USP або "
+                    "злити в один рядок. Виділене можна тягнути гуртом.\n\n"
+                    "**Сирі цитати** (`⋯ → показати сирі цитати` або 🔍): "
+                    "☐ біля цитати виділяє її, `☑ Усі` — всі цитати рядка. "
+                    "Над списком: `↗ Перенести` (в іншу фразу, окремими "
+                    "рядками або одним новим рядком), `🚫 Без USP` (кожна "
+                    "цитата стає окремим рядком у групі «Без USP» — вона "
+                    "лишається в Excel, але вже не роздуває реальну USP), "
+                    "`🗑 Прибрати` (цитати з їхніми голосами зникають з "
+                    "аналізу). Усе це записується в overrides.json і "
+                    "повторюється на наступних прогонах.\n\n"
+                    "**Usage-група** (лише для категорій зі смугами, напр. "
+                    "«Usage»): чіп `[…]` під назвою колонки — це смуга, під "
+                    "якою USP стане в Excel. Клік по чіпу — вибрати наявну "
+                    "смугу, створити нову, перейменувати смугу в усіх USP "
+                    "одразу або зняти її. USP без смуги показано як "
+                    "`[+ usage-група]` і в Excel вона піде у смугу за "
+                    "замовчуванням.\n\n"
+                    "**Клавіші:** `/` — пошук, `Esc` — зняти виділення / "
+                    "закрити меню, `Enter` — підтвердити перейменування, "
+                    "подвійний клік по тексту — переписати його.\n\n"
+                    "**Колонки** згортаються (`⇤`), щоб довга дошка "
+                    "вміщалася; згорнута колонка лишається місцем, куди "
+                    "можна кинути фразу.")
+
+            if bd_view.startswith("🧩"):
+                st.caption(
+                    "Тягніть картки або тисніть **⋯** на картці — усі дії "
+                    "доступні з меню. `/` — пошук, `Esc` — зняти виділення."
+                    + (f" · Фільтр товару: **{bd_prod}** (показано лише його "
+                       "фрази)" if bd_prod else ""))
+                bd_ins = st.session_state.get("board_inspect")
+                if bd_ins and bd_ins not in tax.canonicals:
+                    bd_ins = None                       # merged away meanwhile
+                    st.session_state.pop("board_inspect", None)
+                bd_op = taxonomy_board(
+                    board_payload(tax, bd_cat, min_votes=bd_min,
+                                  product=bd_prod, inspect=bd_ins),
+                    height=bd_height,
+                    key=f"board_{folder.name}_{bd_cat}")
+                # Streamlit replays the last component value on every rerun —
+                # act once per nonce, else the drop repeats forever
+                bd_nonce_key = f"bd_nonce_{folder.name}_{bd_cat}"
+                if bd_op and st.session_state.get(bd_nonce_key) != bd_op.get("nonce"):
+                    st.session_state[bd_nonce_key] = bd_op.get("nonce")
+                    kind = bd_op.get("op")
+                    if kind == "move_rows":
+                        board_edit(
+                            folder, bd_db, "перенесення фраз",
+                            lambda tax, ov: (
+                                me.move_rows(tax, ov, bd_op["rows"],
+                                             bd_op["to_group"]),
+                                [bd_op["to_group"]], list(bd_op["rows"])),
+                            bd_auto)
+                        st.rerun()
+                    elif kind == "rename_group":
+                        board_edit(
+                            folder, bd_db, "перейменування USP",
+                            lambda tax, ov: (
+                                me.rename_group(tax, ov, bd_op["group"],
+                                                bd_op["name"]),
+                                [bd_op["group"]], []),
+                            False)
+                        st.rerun()
+                    elif kind == "rename_row":
+                        board_edit(
+                            folder, bd_db, "перейменування фрази",
+                            lambda tax, ov: (
+                                me.rename_row(tax, ov, bd_op["row"],
+                                              bd_op["text"]),
+                                [], []),
+                            False)
+                        st.rerun()
+                    elif kind == "set_usage_category":
+                        board_edit(
+                            folder, bd_db, "зміну usage-групи",
+                            lambda tax, ov: (
+                                me.set_usage_category(tax, ov, bd_op["group"],
+                                                      bd_op.get("bucket", "")),
+                                [bd_op["group"]], []),
+                            False)
+                        st.rerun()
+                    elif kind == "rename_usage_bucket":
+                        def _rename_band(tax, ov):
+                            note, gids = me.rename_usage_bucket(
+                                tax, ov, bd_cat, bd_op.get("old", ""),
+                                bd_op.get("name", ""))
+                            return note, gids, []
+                        board_edit(folder, bd_db, "перейменування usage-групи",
+                                   _rename_band, False)
+                        st.rerun()
+                    elif kind == "inspect":
+                        # read-only: nothing is written, no undo entry
+                        st.session_state["board_inspect"] = bd_op["row"]
+                        st.rerun()
+                    elif kind in ("merge_groups", "merge_rows", "new_group"):
+                        st.session_state["board_pending"] = bd_op
+                        st.rerun()
+                if bd_ins and bd_ins in tax.canonicals:
+                    board_quotes_panel(folder, bd_db, bd_cat,
+                                       tax.canonicals[bd_ins])
+            else:
+                bd_rows = []
+                for g in sorted(tax.groups_for(bd_cat),
+                                key=lambda g: -g.total(tax)):
+                    for c in sorted(g.canonicals(tax), key=lambda c: -c.total):
+                        # same filters as the board, so the table always shows
+                        # what the board shows — just laid out as Excel will
+                        shown = c.votes.get(bd_prod, 0) if bd_prod else c.total
+                        if shown < (max(bd_min, 1) if bd_prod else bd_min):
+                            continue
+                        bd_rows.append({
+                            "USP": (f"[{g.usage_category}] {g.name}"
+                                    if g.usage_category else g.name),
+                            "Фраза": c.text, "Разом": c.total,
+                            **{p: c.votes.get(p, 0) for p in all_products}})
+                bd_df = pd.DataFrame(bd_rows)
+                st.caption(f"{len(tax.groups_for(bd_cat))} USP · "
+                           f"{len(bd_rows)} рядків — так вони ляжуть в Excel.")
+                st.dataframe(
+                    bd_df, hide_index=True, width="stretch", height=560,
+                    column_config={"Разом": st.column_config.ProgressColumn(
+                        "Разом", format="%d", min_value=0,
+                        max_value=int(bd_df["Разом"].max()) if len(bd_df) else 1)})
+                st.download_button(
+                    "📥 CSV цієї таблиці",
+                    data=bd_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{folder.name}-{bd_cat}.csv", mime="text/csv",
+                    key="bd_csv")
+
+            # ---- usage bands: how this category will be banded in Excel.
+            # The board sorts columns by votes, so the band a USP belongs to is
+            # only visible per-column — this panel is where you see the whole
+            # banding at once, and the USPs that have no band at all.
+            if domain_mod.active().has_subbucket(bd_cat):
+                st.divider()
+                bd_bands: dict[str, list] = {}
+                for g in sorted(tax.groups_for(bd_cat),
+                                key=lambda g: -g.total(tax)):
+                    bd_bands.setdefault(g.usage_category, []).append(g)
+                bd_orphans = bd_bands.pop("", [])
+                with st.expander(
+                        f"🏷 Usage-групи ({len(bd_bands)} смуг · "
+                        f"{len(bd_orphans)} USP без смуги)",
+                        expanded=bool(bd_orphans)):
+                    st.caption("Смуга — заголовок над групою USP на аркуші "
+                               "Excel. Змінити смугу однієї USP можна й на "
+                               "дошці — чіп `[…]` у заголовку колонки.")
+                    for band, gs in sorted(
+                            bd_bands.items(),
+                            key=lambda kv: -sum(g.total(tax) for g in kv[1])):
+                        st.markdown(
+                            f"**{band}** — {len(gs)} USP · "
+                            f"{sum(g.total(tax) for g in gs)} гол.")
+                        st.caption(" · ".join(f"{g.name} ({g.total(tax)})"
+                                              for g in gs))
+                    if bd_orphans:
+                        st.markdown(f"**— без смуги — ({len(bd_orphans)} USP)**")
+                        st.caption("В Excel вони підуть у смугу за "
+                                   "замовчуванням. Призначте смугу тут:")
+                        bd_opts = me.usage_buckets(tax, bd_cat)
+                        BAND_NEW = "✏️ нова смуга…"
+                        for g in bd_orphans:
+                            o1, o2, o3 = st.columns([4, 4, 1])
+                            o1.markdown(f"«{g.name}» · {g.total(tax)} гол.")
+                            pick = o2.selectbox(
+                                "Смуга", bd_opts + [BAND_NEW],
+                                key=f"bd_band_{g.id}",
+                                label_visibility="collapsed")
+                            val = pick
+                            if pick == BAND_NEW:
+                                val = o2.text_input(
+                                    "Назва смуги", key=f"bd_bandnew_{g.id}",
+                                    label_visibility="collapsed",
+                                    placeholder="назва нової смуги")
+                            val = (val or "").strip()
+                            if o3.button("🏷", key=f"bd_bandset_{g.id}",
+                                         help="Призначити цю смугу",
+                                         disabled=not val):
+                                board_edit(
+                                    folder, bd_db, "зміну usage-групи",
+                                    lambda tax, ov, gid=g.id, b=val: (
+                                        me.set_usage_category(tax, ov, gid, b),
+                                        [gid], []),
+                                    False)
+                                st.rerun()
+
+            # ---- what else could be merged (deterministic, no LLM calls)
+            st.divider()
+            bd_last = st.session_state.get("board_last") or {}
+            bd_moved = [r for r in bd_last.get("rows", []) if r in tax.canonicals]
+            bd_moved = [r for r in bd_moved
+                        if me.category_of(tax, tax.canonicals[r]) == bd_cat]
+            if bd_moved:
+                bd_follow = me.suggest_row_moves(tax, bd_moved)
+                if bd_follow:
+                    tgt_gid = tax.canonicals[bd_moved[0]].group_id
+                    tgt_name = tax.groups[tgt_gid].name
+                    with st.container(border=True):
+                        st.markdown(f"**🧲 Схожі фрази в інших USP** — "
+                                    f"перенести теж у «{tgt_name}»?")
+                        for i, s in enumerate(bd_follow):
+                            f1, f2 = st.columns([12, 1])
+                            f1.markdown(f"«{s['text']}» · **{s['score']}** "
+                                        f"схожості з «{s['like']}» — зараз у "
+                                        f"«{s['from']}»")
+                            if f2.button("➡", key=f"bd_follow_{i}",
+                                         help="Перенести сюди"):
+                                board_edit(
+                                    folder, bd_db, "перенесення схожої фрази",
+                                    lambda tax, ov, rid=s["row"]: (
+                                        me.move_rows(tax, ov, [rid], tgt_gid),
+                                        [tgt_gid], [rid]),
+                                    bd_auto)
+                                st.rerun()
+                        if len(bd_follow) > 1 and st.button(
+                                "➡ Перенести всі", key="bd_follow_all"):
+                            ids = [s["row"] for s in bd_follow]
+                            board_edit(
+                                folder, bd_db, "перенесення схожих фраз",
+                                lambda tax, ov: (
+                                    me.move_rows(tax, ov, ids, tgt_gid),
+                                    [tgt_gid], ids),
+                                bd_auto)
+                            st.rerun()
+
+            bd_dups: list[dict] = []
+            for g in tax.groups_for(bd_cat):
+                bd_dups += me.suggest_row_merges(tax, g.id, limit=4)
+            bd_dups.sort(key=lambda d: -d["score"])
+            bd_dups = bd_dups[:10]
+            bd_gpairs = me.suggest_group_merges(tax, bd_cat)
+            if bd_dups or bd_gpairs:
+                with st.expander(
+                        f"🤖 Кандидати на об'єднання "
+                        f"({len(bd_dups)} рядків · {len(bd_gpairs)} USP)",
+                        expanded=bool(bd_moved)):
+                    st.caption("Лексична схожість, без LLM. Те, що гейт "
+                               "визнає тим самим повідомленням, уже злито "
+                               "автоматично — тут лишилось те, що потребує "
+                               "вашого рішення.")
+                    for i, d in enumerate(bd_dups):
+                        d1, d2 = st.columns([12, 1])
+                        why = (f" · ⛔ {d['blocked']}" if d["blocked"]
+                               else " · збіг за словами")
+                        d1.markdown(f"«{d['other_text']}» → «{d['keep_text']}» "
+                                    f"· **{d['score']}**{why}")
+                        if d2.button("🔗", key=f"bd_dup_{i}",
+                                     help="Злити в популярніший рядок"):
+                            st.session_state["board_pending"] = {
+                                "op": "merge_rows", "rows": [d["other"]],
+                                "into": d["keep"], "nonce": 0}
+                            st.rerun()
+                    if bd_dups and bd_gpairs:
+                        st.divider()
+                    for i, p in enumerate(bd_gpairs):
+                        g1, g2 = st.columns([12, 1])
+                        g1.markdown(f"USP «{p['other_name']}» → "
+                                    f"«{p['keep_name']}» · **{p['score']}**")
+                        if g2.button("🔀", key=f"bd_gp_{i}",
+                                     help="Злити ці USP"):
+                            st.session_state["board_pending"] = {
+                                "op": "merge_groups", "source": p["other"],
+                                "target": p["keep"], "nonce": 0}
+                            st.rerun()
+
+            st.divider()
+            bd_c1, bd_c2 = st.columns([2, 3])
+            if bd_c1.button("📄 Перегенерувати Excel", type="primary",
+                            width="stretch", key="bd_excel"):
+                out = regenerate_excel(folder)
+                st.toast(f"Записано {out.name} (без LLM-викликів)", icon="📄")
+                excel_download(out, "dl_board")
+            bd_c2.caption("Кожна дія тут одразу записується в scoring.db **і** "
+                          "в overrides.json — тож переживає наступні прогони "
+                          "пайплайна (навіть «з нуля»). Список правил — на "
+                          "вкладці «✏️ Корекції».")
+
+
 # ---------------------------------------------------------------- per-product
 with tab_by_prod:
     bp_db = taxonomy_db(folder)
@@ -1423,9 +2271,9 @@ with tab_fix:
         groups_sorted = sorted(tax.groups.values(), key=lambda g: -g.total(tax))
         cans_sorted = sorted(tax.canonicals.values(), key=lambda c: -c.total)
 
-        fix_rn, fix_rc, fix_mg, fix_mv, fix_mc = st.tabs(
+        fix_rn, fix_rc, fix_mg, fix_mv, fix_mc, fix_uc = st.tabs(
             ["✏️ Перейменувати групу", "🏷 Перейменувати фразу", "🔀 Злити групи",
-             "📌 Перенести фразу", "🔗 Злити фрази"])
+             "📌 Перенести фразу", "🔗 Злити фрази", "🏷 Usage-група"])
 
         with fix_rn:
             with st.container(border=True):
@@ -1496,10 +2344,49 @@ with tab_fix:
                     save_overrides(folder, ov)
                     st.rerun()
 
+        with fix_uc:
+            with st.container(border=True):
+                # only categories that actually band their groups (subbucket) —
+                # elsewhere the field is written but never read by Excel
+                uc_cats = [c for c in domain_mod.active().ids()
+                           if domain_mod.active().has_subbucket(c)
+                           and tax.groups_for(c)]
+                if not uc_cats:
+                    st.caption("У цьому домені немає категорій зі смугами "
+                               "(usage-групами).")
+                else:
+                    uc_groups = [g for c in uc_cats for g in groups_sorted
+                                 if g.category == c]
+                    uc_g = st.selectbox(
+                        "USP", uc_groups, key="uc_g",
+                        format_func=lambda g: (
+                            f"{g.name}  ·  "
+                            f"[{g.usage_category or '— без смуги —'}]  "
+                            f"({g.total(tax)})"))
+                    uc_opts = me.usage_buckets(tax, uc_g.category)
+                    UC_NEW = "✏️ нова смуга…"
+                    UC_NONE = "🚫 без смуги"
+                    uc_pick = st.selectbox("Смуга (usage-група)",
+                                           uc_opts + [UC_NEW, UC_NONE],
+                                           key="uc_pick")
+                    uc_val = "" if uc_pick == UC_NONE else uc_pick
+                    if uc_pick == UC_NEW:
+                        uc_val = st.text_input("Назва нової смуги",
+                                               key="uc_new")
+                    uc_val = (uc_val or "").strip()
+                    st.caption("Правило застосовується ОСТАННІМ — після "
+                               "перейменувань, злиття і створення USP, тож "
+                               "переживає їх усі.")
+                    if st.button("➕ Додати правило", key="uc_add",
+                                 disabled=uc_pick == UC_NEW and not uc_val):
+                        ov.setdefault("usage_category", {})[uc_g.name] = uc_val
+                        save_overrides(folder, ov)
+                        st.rerun()
+
         st.divider()
         n_rules = sum(len(ov.get(k, ())) for k in
                      ("rename", "rename_canonical", "merge_groups",
-                      "move_canonical", "merge_canonicals"))
+                      "move_canonical", "merge_canonicals", "usage_category"))
         st.markdown(f"### 📋 Поточні корекції ({n_rules})")
         if not n_rules:
             st.caption("Поки що порожньо. Корекції застосовуються після кожного "
@@ -1553,6 +2440,14 @@ with tab_fix:
                              f"→ «{texts[0]}»",
                              f"del_mc_{i}",
                              lambda idx=i: ov["merge_canonicals"].pop(idx))
+
+                for name in list(ov.get("usage_category", {})):
+                    band = ov["usage_category"][name]
+                    rule_row(group_exists(tax, name),
+                             (f"Usage-група «{name}» → «{band}»" if band
+                              else f"Зняти usage-групу з «{name}»"),
+                             f"del_uc_{name}",
+                             lambda n=name: ov["usage_category"].pop(n))
 
             st.divider()
             if st.button("📄 Застосувати й перегенерувати Excel", type="primary",

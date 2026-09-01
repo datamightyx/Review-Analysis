@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --fg: #262730;
+    --bg: #ffffff;
+    --panel: rgba(0,0,0,.04);
+    --border: rgba(0,0,0,.14);
+    --acc: #2a78d6;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: transparent;
+               color: var(--fg); font-size: 14px;
+               font-family: "Source Sans Pro", system-ui, sans-serif; }
+
+  .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+             padding: 0 2px 8px; }
+  .toolbar input[type=search] {
+      flex: 1 1 220px; min-width: 160px; padding: 6px 10px;
+      border-radius: 8px; border: 1px solid var(--border);
+      background: var(--panel); color: var(--fg); font-size: 13px; }
+  .hint { opacity: .6; font-size: 12px; }
+  .pill { border: 1px solid var(--border); background: var(--panel);
+          border-radius: 999px; padding: 3px 10px; font-size: 12px;
+          cursor: pointer; user-select: none; }
+  .pill:hover { border-color: var(--acc); color: var(--acc); }
+
+  /* bulk bar — appears only while something is selected */
+  .selbar { display: none; align-items: center; gap: 8px; flex-wrap: wrap;
+            padding: 6px 9px; margin: 0 2px 8px;
+            border: 1px solid var(--acc); border-radius: 10px;
+            background: rgba(42,120,214,.10); }
+  .selbar.on { display: flex; }
+  .selbar select, .selbar button {
+      font: inherit; font-size: 12.5px; padding: 4px 8px; border-radius: 8px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+      cursor: pointer; max-width: 260px; }
+  .selbar button:hover:not(:disabled), .selbar select:hover {
+      border-color: var(--acc); color: var(--acc); }
+  .selbar button:disabled { opacity: .45; cursor: default; }
+  .selcount { font-weight: 700; color: var(--acc); }
+
+  .board { display: flex; gap: 12px; overflow-x: auto; overflow-y: hidden;
+           padding-bottom: 8px; align-items: stretch; }
+  .col { flex: 0 0 300px; display: flex; flex-direction: column;
+         border: 1px solid var(--border); border-radius: 12px;
+         background: var(--panel); }
+  .col-head { padding: 9px 11px; border-bottom: 1px solid var(--border);
+              cursor: grab; border-radius: 12px 12px 0 0; flex: 0 0 auto; }
+  .col-head:active { cursor: grabbing; }
+  .col-head.over { background: rgba(42,120,214,.22);
+                   outline: 2px dashed var(--acc); outline-offset: -3px; }
+  .col-title { display: flex; align-items: baseline; gap: 6px; }
+  .col-name { font-weight: 600; line-height: 1.25; word-break: break-word;
+              flex: 1; }
+  .col-name[contenteditable=true] { outline: 2px solid var(--acc);
+              border-radius: 5px; padding: 1px 3px; cursor: text; }
+  .col-meta { opacity: .65; font-size: 12px; margin-top: 3px; }
+  .ucat { font-size: 11px; opacity: .75; cursor: pointer;
+          border-bottom: 1px dashed var(--border); }
+  .ucat:hover { opacity: 1; }
+  .ucat.none { opacity: .38; font-style: italic; }
+  .ucat[contenteditable=true] { outline: 2px solid var(--acc); opacity: 1;
+          border-radius: 5px; padding: 0 3px; cursor: text;
+          font-style: normal; border-bottom: none; }
+  .icon { opacity: .45; cursor: pointer; font-size: 12px; padding: 0 2px; }
+  .icon:hover { opacity: 1; }
+
+  .col-body { padding: 8px; overflow-y: auto; flex: 1 1 auto; min-height: 60px; }
+  .col-body.over { background: rgba(42,120,214,.14);
+                   outline: 2px dashed var(--acc); outline-offset: -4px;
+                   border-radius: 0 0 12px 12px; }
+
+  .card { border: 1px solid var(--border); border-radius: 9px;
+          background: var(--bg); padding: 7px 9px; margin-bottom: 7px;
+          cursor: grab; transition: box-shadow .12s, border-color .12s;
+          user-select: none; }
+  .card-top { display: flex; gap: 6px; align-items: flex-start; }
+  .cb { flex: 0 0 auto; font-size: 14px; line-height: 1.25; opacity: .5;
+        cursor: pointer; }
+  .cb:hover { opacity: 1; }
+  .cb.on { opacity: 1; color: var(--acc); }
+  [contenteditable=true] { user-select: text; }
+  .card:hover { border-color: var(--acc); }
+  .card:active { cursor: grabbing; }
+  .card.sel { border-color: var(--acc);
+              box-shadow: 0 0 0 2px rgba(42,120,214,.35); }
+  .card.drag { opacity: .4; }
+  /* the row whose raw quotes are open in the panel below the board */
+  .card.insp { border-left: 4px solid var(--acc); }
+  .card.over { outline: 2px dashed var(--acc); outline-offset: 2px;
+               background: rgba(42,120,214,.12); }
+  .card.over::after { content: "🔗 злити з цим рядком"; display: block;
+               font-size: 11px; color: var(--acc); margin-top: 4px; }
+  .card-text { line-height: 1.32; word-break: break-word; flex: 1; }
+  .card-text[contenteditable=true] { outline: 2px solid var(--acc);
+               border-radius: 5px; padding: 1px 3px; cursor: text; }
+  .card-foot { display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+               margin-top: 5px; }
+  .tot { font-weight: 700; font-size: 12px; color: var(--acc); }
+  .chip { font-size: 10.5px; border: 1px solid var(--border);
+          border-radius: 999px; padding: 0 6px; opacity: .8; }
+
+  .newzone { flex: 0 0 190px; border: 2px dashed var(--border);
+             border-radius: 12px; padding: 16px 12px; text-align: center;
+             font-size: 13px; opacity: .75; }
+  .newzone.over { border-color: var(--acc); color: var(--acc);
+                  background: rgba(42,120,214,.12); opacity: 1; }
+  .empty { opacity: .5; font-size: 12px; padding: 6px 2px; }
+
+  /* keyboard users get the same affordances the mouse gets */
+  :focus-visible { outline: 2px solid var(--acc); outline-offset: 2px;
+                   border-radius: 4px; }
+
+  /* filter feedback: matches lit up, columns without matches faded but
+     still present — a faded column is still a drop target */
+  mark.hi { background: rgba(42,120,214,.30); color: inherit;
+            border-radius: 3px; padding: 0 1px; }
+  .col.dim { opacity: .40; }
+  .col.dim:hover { opacity: 1; }
+
+  /* how loud this USP is next to the loudest one in the category */
+  .bar { height: 3px; border-radius: 3px; margin-top: 6px;
+         background: var(--border); overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--acc); }
+
+  /* collapsed column — parks a finished USP without losing it as a drop target */
+  .col.mini { flex: 0 0 46px; }
+  .col.mini .col-head { height: 100%; border-bottom: none; border-radius: 12px;
+                        display: flex; flex-direction: column; align-items: center;
+                        gap: 7px; padding: 9px 5px; overflow: hidden; }
+  .mini-name { writing-mode: vertical-rl; text-orientation: mixed;
+               font-weight: 600; font-size: 12.5px; white-space: nowrap;
+               overflow: hidden; text-overflow: ellipsis; flex: 1 1 auto; }
+  .mini-tot { font-size: 11px; font-weight: 700; color: var(--acc); }
+
+  /* right-click / ⋯ menu — every drag gesture also reachable by clicking */
+  .menu { position: fixed; z-index: 50; min-width: 215px; max-width: 330px;
+          max-height: 330px; overflow-y: auto; padding: 4px;
+          background: var(--bg); color: var(--fg);
+          border: 1px solid var(--border); border-radius: 10px;
+          box-shadow: 0 8px 26px rgba(0,0,0,.22); }
+  .menu-item { padding: 6px 9px; border-radius: 7px; font-size: 13px;
+               cursor: pointer; white-space: nowrap; overflow: hidden;
+               text-overflow: ellipsis; }
+  .menu-item:hover { background: rgba(42,120,214,.14); color: var(--acc); }
+  .menu-item.off { opacity: .4; cursor: default; }
+  .menu-item.off:hover { background: none; color: inherit; }
+  .menu-head { padding: 7px 9px 4px; font-size: 11px; opacity: .6;
+               letter-spacing: .04em; text-transform: uppercase; }
+  .menu-sep { height: 1px; background: var(--border); margin: 4px 2px; }
+  .stat { font-size: 12px; opacity: .7; white-space: nowrap; }
+  .card-acts { display: flex; justify-content: flex-end; gap: 4px;
+               margin-top: 4px; opacity: .55; transition: opacity .12s; }
+  .card:hover .card-acts, .card.sel .card-acts { opacity: 1; }
+  .card-acts .icon { font-size: 13px; padding: 0 3px; }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <input type="search" id="flt"
+         placeholder="🔍 фільтр за фразою або назвою USP…  ( / )">
+  <span class="stat" id="stat"></span>
+  <span class="pill" id="collapse-all" title="Згорнути / розгорнути всі колонки"
+        >⇤ Згорнути всі</span>
+  <span class="hint" id="hint"></span>
+</div>
+<div class="selbar" id="selbar"></div>
+<div class="board" id="board"></div>
+
+<script>
+// ---------------------------------------------------------------- protocol
+// Hand-rolled Streamlit component protocol — no streamlit-component-lib
+// bundle needed: componentReady once on load, then one message per render.
+function send(type, extra) {
+  window.parent.postMessage(
+    Object.assign({isStreamlitMessage: true, type: type}, extra || {}), "*");
+}
+function setFrameHeight(h) { send("streamlit:setFrameHeight", {height: h}); }
+function setValue(v) {
+  send("streamlit:setComponentValue", {value: v, dataType: "json"});
+}
+
+let DATA = {groups: [], products: []};
+let HEIGHT = 640;
+const sel = new Set();   // selected canonical ids — survive Streamlit reruns
+let ROWS = {};           // id -> row, rebuilt each render
+let anchor = null;       // last clicked row id — Shift+click range starts here
+let drag = null;         // {kind:"rows", ids:[...]} | {kind:"group", id:"g1"}
+let filter = "";
+const mini = new Set();  // collapsed group ids — survive Streamlit reruns
+let MENU = null;         // open context menu element, if any
+let MAXTOT = 1;          // votes of the loudest USP — scales the header bars
+
+window.addEventListener("message", function (e) {
+  if (!e.data || e.data.type !== "streamlit:render") return;
+  const args = e.data.args || {};
+  DATA = args.data || {groups: [], products: []};
+  HEIGHT = args.height || 640;
+  applyTheme(e.data.theme);
+  render();
+});
+
+function applyTheme(t) {
+  if (!t) return;
+  const r = document.documentElement.style;
+  if (t.textColor) r.setProperty("--fg", t.textColor);
+  if (t.backgroundColor) r.setProperty("--bg", t.backgroundColor);
+  if (t.secondaryBackgroundColor)
+    r.setProperty("--panel", t.secondaryBackgroundColor);
+  if (t.primaryColor) r.setProperty("--acc", t.primaryColor);
+  r.setProperty("--border", t.base === "dark" ? "rgba(255,255,255,.20)"
+                                              : "rgba(0,0,0,.14)");
+}
+
+// ---------------------------------------------------------------- emit
+function emit(op, extra) {
+  setValue(Object.assign({op: op, nonce: Date.now()}, extra));
+}
+// dragging a card that belongs to a multi-selection moves the whole selection
+function selectedOr(id) {
+  return sel.has(id) && sel.size > 1 ? Array.from(sel) : [id];
+}
+// a bulk action consumes the selection: leaving cards lit after the rows have
+// already moved reads as "did it work?"
+function emitClear(op, extra) {
+  emit(op, extra);
+  sel.clear();
+  anchor = null;
+  render();
+}
+
+// ---------------------------------------------------------------- menu
+// Every drag gesture has a click path too: dragging across a 20-column board
+// is precise work, and some people simply cannot do it comfortably.
+function closeMenu() {
+  if (MENU) { MENU.remove(); MENU = null; }
+}
+document.addEventListener("mousedown", function (ev) {
+  if (MENU && !MENU.contains(ev.target)) closeMenu();
+}, true);
+window.addEventListener("blur", closeMenu);
+
+// items: {label, fn, disabled, title} | {head} | {sep}
+function openMenu(x, y, items) {
+  closeMenu();
+  const m = document.createElement("div");
+  m.className = "menu";
+  items.forEach(function (it) {
+    if (it.sep) {
+      const d = document.createElement("div");
+      d.className = "menu-sep";
+      m.appendChild(d);
+      return;
+    }
+    if (it.head) {
+      const h = document.createElement("div");
+      h.className = "menu-head";
+      h.textContent = it.head;
+      m.appendChild(h);
+      return;
+    }
+    const b = document.createElement("div");
+    b.className = "menu-item" + (it.disabled ? " off" : "");
+    b.textContent = it.label;
+    if (it.title) b.title = it.title;
+    if (!it.disabled) {
+      b.onclick = function (ev) { ev.stopPropagation(); closeMenu(); it.fn(); };
+    }
+    m.appendChild(b);
+  });
+  document.body.appendChild(m);
+  if (!isFinite(x)) x = 20;      // caller had no pointer coordinates
+  if (!isFinite(y)) y = 20;
+  // the iframe is short — a menu that opens past its edge is invisible
+  m.style.left = Math.max(4, Math.min(x, window.innerWidth - m.offsetWidth - 6))
+                 + "px";
+  m.style.top = Math.max(4, Math.min(y, window.innerHeight - m.offsetHeight - 6))
+                + "px";
+  MENU = m;
+}
+// second level opens in place with a way back — no hover-timing submenus
+function subMenu(x, y, title, back, items) {
+  openMenu(x, y, [{head: title}, {label: "← назад", fn: back}, {sep: true}]
+                 .concat(items));
+}
+
+// ---------------------------------------------------------------- autoscroll
+// The board scrolls horizontally: without this, a column parked off-screen is
+// unreachable by drag — you cannot scroll and hold a card at the same time.
+let dragPt = null, autoTimer = null;
+function trackDrag(ev) { dragPt = {x: ev.clientX, y: ev.clientY}; }
+function startAuto() {
+  document.addEventListener("dragover", trackDrag, true);
+  if (!autoTimer) autoTimer = setInterval(autoStep, 40);
+}
+function stopAuto() {
+  document.removeEventListener("dragover", trackDrag, true);
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  dragPt = null;
+}
+function autoStep() {
+  if (!dragPt) return;
+  const board = document.getElementById("board");
+  const b = board.getBoundingClientRect();
+  const EDGE = 90, MAX = 26;
+  if (dragPt.y >= b.top && dragPt.y <= b.bottom) {
+    const l = dragPt.x - b.left, r = b.right - dragPt.x;
+    if (l < EDGE) board.scrollLeft -= MAX * (EDGE - Math.max(l, 0)) / EDGE;
+    else if (r < EDGE) board.scrollLeft += MAX * (EDGE - Math.max(r, 0)) / EDGE;
+  }
+  // and a long column scrolls under the pointer the same way
+  const el = document.elementFromPoint(dragPt.x, dragPt.y);
+  const body = el && el.closest ? el.closest(".col-body") : null;
+  if (!body) return;
+  const c = body.getBoundingClientRect();
+  const t = dragPt.y - c.top, bo = c.bottom - dragPt.y;
+  if (t < 46) body.scrollTop -= 16 * (46 - Math.max(t, 0)) / 46;
+  else if (bo < 46) body.scrollTop += 16 * (46 - Math.max(bo, 0)) / 46;
+}
+
+// ---------------------------------------------------------------- keyboard
+document.addEventListener("keydown", function (ev) {
+  const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName)
+                  || ev.target.isContentEditable;
+  if (ev.key === "Escape") {
+    if (MENU) { closeMenu(); return; }
+    if (inField) { ev.target.blur(); return; }
+    if (sel.size) { sel.clear(); anchor = null; render(); }
+    return;
+  }
+  if (ev.key === "/" && !inField) {   // same reflex as every search UI
+    ev.preventDefault();
+    refocusFilter();
+  }
+});
+
+// ---------------------------------------------------------------- selection
+function groupHit(g) {
+  const q = filter.trim().toLowerCase();
+  return !!q && (g.name || "").toLowerCase().indexOf(q) >= 0;
+}
+// a filter hit on the USP name keeps the whole column visible: you are usually
+// looking for the column, not for one phrase inside it
+function visibleRows(g) {
+  const q = filter.trim().toLowerCase();
+  if (!q || groupHit(g)) return g.rows;
+  return g.rows.filter(r => r.text.toLowerCase().indexOf(q) >= 0);
+}
+function toggleRow(id, rows, range) {
+  const a = anchor ? rows.findIndex(x => x.id === anchor) : -1;
+  const b = rows.findIndex(x => x.id === id);
+  if (range && a >= 0 && b >= 0) {          // Shift+click: whole run at once
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    for (let i = lo; i <= hi; i++) sel.add(rows[i].id);
+  } else if (sel.has(id)) {
+    sel.delete(id);
+  } else {
+    sel.add(id);
+  }
+  anchor = id;
+  render();
+}
+
+// ---------------------------------------------------------------- render
+function render() {
+  const board = document.getElementById("board");
+  closeMenu();
+  // innerHTML = "" throws the scroll away; after every edit the board would
+  // snap back to the first column and you would lose your place
+  const keepX = board.scrollLeft;
+  board.innerHTML = "";
+
+  const alive = new Set();
+  const gids = new Set();
+  ROWS = {};
+  DATA.groups.forEach(g => {
+    gids.add(g.id);
+    g.rows.forEach(r => { alive.add(r.id); ROWS[r.id] = r; });
+  });
+  Array.from(sel).forEach(id => { if (!alive.has(id)) sel.delete(id); });
+  Array.from(mini).forEach(id => { if (!gids.has(id)) mini.delete(id); });
+  if (anchor && !alive.has(anchor)) anchor = null;
+
+  MAXTOT = DATA.groups.reduce((m, g) => Math.max(m, g.total || 0), 0) || 1;
+  DATA.groups.forEach(g => board.appendChild(column(g)));
+  board.appendChild(newZone());
+  board.scrollLeft = keepX;
+
+  statBar();
+  document.getElementById("hint").textContent =
+    "клік — виділити · Shift — діапазон · ⋯ або права кнопка — усі дії "
+    + "без перетягування";
+
+  const f = document.getElementById("flt");
+  f.value = filter;
+  f.oninput = function () { filter = f.value; render(); refocusFilter(); };
+
+  const ca = document.getElementById("collapse-all");
+  const allMini = DATA.groups.length > 0 && DATA.groups.every(g => mini.has(g.id));
+  ca.textContent = allMini ? "⇥ Розгорнути всі" : "⇤ Згорнути всі";
+  ca.onclick = function () {
+    mini.clear();
+    if (!allMini) DATA.groups.forEach(g => mini.add(g.id));
+    render();
+  };
+
+  selBar();
+  // the bulk bar appears and disappears, and the toolbar wraps on narrow
+  // screens — measure instead of subtracting a hardcoded toolbar height
+  board.style.height =
+    Math.max(180, HEIGHT - board.offsetTop - 6) + "px";
+  setFrameHeight(HEIGHT);
+}
+
+// "how big is what I am looking at" — and, while filtering, how much of it
+// the filter is actually showing
+function statBar() {
+  const el = document.getElementById("stat");
+  const gs = DATA.groups.length;
+  const rows = DATA.groups.reduce((n, g) => n + g.rows.length, 0);
+  const votes = DATA.groups.reduce((n, g) => n + (g.total || 0), 0);
+  if (!filter.trim()) {
+    // with a product filter the phrase count is that product's, while the vote
+    // counts on the cards stay category-wide — say so instead of implying both
+    el.textContent = DATA.product
+      ? gs + " USP · " + rows + " фраз товару «" + DATA.product + "» · "
+        + votes + " голосів (усі товари)"
+      : gs + " USP · " + rows + " фраз · " + votes + " голосів";
+    return;
+  }
+  let hitRows = 0, hitCols = 0;
+  DATA.groups.forEach(function (g) {
+    const v = visibleRows(g).length;
+    hitRows += v;
+    if (v) hitCols++;
+  });
+  el.textContent = "знайдено " + hitRows + " з " + rows + " фраз у "
+                   + hitCols + " USP";
+}
+
+// bulk actions on the whole selection — no pixel-dragging required
+function selBar() {
+  const bar = document.getElementById("selbar");
+  bar.innerHTML = "";
+  bar.className = "selbar" + (sel.size ? " on" : "");
+  if (!sel.size) return;
+  const ids = Array.from(sel);
+
+  const seen = new Set();
+  DATA.groups.forEach(g => visibleRows(g).forEach(r => seen.add(r.id)));
+  const off = ids.filter(id => !seen.has(id)).length;
+
+  const cnt = document.createElement("span");
+  cnt.className = "selcount";
+  cnt.textContent = "Виділено " + ids.length;
+  bar.appendChild(cnt);
+  if (off) {
+    const w = document.createElement("span");
+    w.className = "hint";
+    w.textContent = "(" + off + " сховано фільтром — теж поїдуть)";
+    bar.appendChild(w);
+  }
+
+  const mv = document.createElement("select");
+  mv.title = "Перенести всі виділені фрази в цю USP";
+  mv.appendChild(new Option("📦 Перенести всі в USP…", ""));
+  DATA.groups.forEach(function (g) {
+    mv.appendChild(new Option(g.name + " · " + g.total + " гол.", g.id));
+  });
+  mv.onchange = function () {
+    if (mv.value) emitClear("move_rows", {rows: ids, to_group: mv.value});
+  };
+  bar.appendChild(mv);
+
+  bar.appendChild(btn("➕ Нова USP з виділених", false, function () {
+    emitClear("new_group", {rows: ids});
+  }));
+  bar.appendChild(btn("🔗 Злити в один рядок", ids.length < 2, function () {
+    // the fattest line wins by default; the dialog still asks for the wording
+    let into = ids[0];
+    ids.forEach(function (id) {
+      if (ROWS[id] && ROWS[into] && ROWS[id].total > ROWS[into].total) into = id;
+    });
+    emitClear("merge_rows", {rows: ids, into: into});
+  }));
+  bar.appendChild(btn("✕ Зняти виділення (Esc)", false, function () {
+    sel.clear();
+    anchor = null;
+    render();
+  }));
+}
+
+function btn(label, disabled, fn) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  b.disabled = disabled;
+  if (disabled) b.title = "Потрібно щонайменше дві виділені фрази";
+  b.onclick = fn;
+  return b;
+}
+
+function refocusFilter() {
+  const f = document.getElementById("flt");
+  f.focus();
+  f.setSelectionRange(f.value.length, f.value.length);
+}
+
+// the header is both a drag source (merge USP) and a drop target
+// (merge USP / move rows) — identical in the expanded and collapsed column
+function wireHeadDrag(head, g) {
+  head.addEventListener("dragstart", function (ev) {
+    drag = {kind: "group", id: g.id};
+    ev.dataTransfer.effectAllowed = "move";
+    ev.dataTransfer.setData("text/plain", g.id);
+    startAuto();
+  });
+  head.addEventListener("dragend", function () {
+    drag = null;
+    stopAuto();
+    render();
+  });
+  head.addEventListener("dragover", function (ev) {
+    if (!drag) return;
+    if (drag.kind === "group" && drag.id === g.id) return;
+    ev.preventDefault();
+    head.classList.add("over");
+  });
+  head.addEventListener("dragleave", function () {
+    head.classList.remove("over");
+  });
+  head.addEventListener("drop", function (ev) {
+    ev.preventDefault();
+    head.classList.remove("over");
+    stopAuto();
+    if (!drag) return;
+    if (drag.kind === "group") {
+      emit("merge_groups", {source: drag.id, target: g.id});
+    } else {
+      emit("move_rows", {rows: drag.ids, to_group: g.id});
+    }
+    drag = null;
+  });
+}
+
+function icon(glyph, title, fn) {
+  const s = document.createElement("span");
+  s.className = "icon";
+  s.textContent = glyph;
+  s.title = title;
+  s.tabIndex = 0;
+  s.onclick = function (ev) { ev.stopPropagation(); fn(ev); };
+  s.onkeydown = function (ev) {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    ev.preventDefault();
+    // a keyboard event carries no coordinates — anchor the menu to the icon
+    const r = s.getBoundingClientRect();
+    fn({clientX: r.left, clientY: r.bottom + 2});
+  };
+  return s;
+}
+
+function groupLabel(g) {
+  // the band travels with the name everywhere the name is offered — a phrase
+  // moved into another USP also changes which Excel band it lands under
+  return (g.usage_category ? "[" + g.usage_category + "] " : "")
+         + g.name + " · " + g.total + " гол.";
+}
+
+// every action a USP header supports by dragging, spelled out
+function groupMenu(g, x, y) {
+  const rows = visibleRows(g);
+  const allOn = rows.length > 0 && rows.every(r => sel.has(r.id));
+  const others = DATA.groups.filter(o => o.id !== g.id);
+  const back = function () { groupMenu(g, x, y); };
+  const band = DATA.has_bucket
+    ? [{label: "🏷 Usage-група: "
+               + (g.usage_category ? "«" + g.usage_category + "»" : "— немає —")
+               + "…",
+        title: "Смуга, під якою ця USP стане в Excel",
+        fn: function () { bucketMenu(g, x, y); }}]
+    : [];
+  openMenu(x, y, [
+    {head: g.name},
+    {label: allOn ? "☐ Зняти виділення з колонки"
+                  : "☑ Виділити всі фрази колонки (" + rows.length + ")",
+     disabled: !rows.length,
+     fn: function () {
+       rows.forEach(r => { if (allOn) sel.delete(r.id); else sel.add(r.id); });
+       anchor = rows.length ? rows[rows.length - 1].id : anchor;
+       render();
+     }},
+    {label: "✏️ Перейменувати USP", fn: function () { startGroupRename(g); }},
+  ].concat(band, [
+    {sep: true},
+    {label: "📦 Перенести всі фрази в іншу USP…",
+     disabled: !g.rows.length || !others.length,
+     fn: function () {
+       subMenu(x, y, "Перенести " + g.rows.length + " фраз у:", back,
+         others.map(o => ({label: groupLabel(o), fn: function () {
+           emitClear("move_rows", {rows: g.rows.map(r => r.id),
+                                   to_group: o.id});
+         }})));
+     }},
+    {label: "🔀 Злити цю USP з іншою…", disabled: !others.length,
+     fn: function () {
+       subMenu(x, y, "Влити «" + g.name + "» в:", back,
+         others.map(o => ({label: groupLabel(o), fn: function () {
+           emit("merge_groups", {source: g.id, target: o.id});
+         }})));
+     }},
+    {sep: true},
+    {label: mini.has(g.id) ? "⇥ Розгорнути колонку" : "⇤ Згорнути колонку",
+     fn: function () {
+       if (mini.has(g.id)) mini.delete(g.id); else mini.add(g.id);
+       render();
+     }},
+  ]));
+}
+
+// ---------------------------------------------------------------- usage band
+// Only relation categories with a subbucket carry one (DATA.has_bucket) — on
+// positive/negative the whole chip and its menu item stay away.
+function bucketChip(g) {
+  const chip = document.createElement("span");
+  chip.className = "ucat" + (g.usage_category ? "" : " none");
+  chip.textContent = g.usage_category ? "[" + g.usage_category + "] "
+                                      : "[+ usage-група] ";
+  chip.setAttribute("data-ucat", g.id);
+  chip.title = g.usage_category
+    ? "Usage-група «" + g.usage_category + "» — смуга над цією USP в Excel. "
+      + "Клік, щоб змінити."
+    : "Ця USP без usage-групи — в Excel піде у смугу за замовчуванням. "
+      + "Клік, щоб призначити.";
+  chip.onclick = function (ev) {
+    ev.stopPropagation();
+    bucketMenu(g, ev.clientX, ev.clientY);
+  };
+  return chip;
+}
+
+function bucketMenu(g, x, y) {
+  const items = [{head: "Usage-група · " + g.name}];
+  (DATA.buckets || []).forEach(function (b) {
+    const on = b === g.usage_category;
+    items.push({label: (on ? "✓ " : "🏷 ") + b, disabled: on,
+                title: on ? "Уже в цій usage-групі" : "Перенести сюди",
+                fn: function () {
+                  emit("set_usage_category", {group: g.id, bucket: b});
+                }});
+  });
+  if ((DATA.buckets || []).length) items.push({sep: true});
+  items.push({label: "✏️ Нова usage-група…",
+              title: "Ввести назву прямо в заголовку колонки",
+              fn: function () { startBucketEdit(g, "set"); }});
+  if (g.usage_category) {
+    items.push({label: "🔤 Перейменувати «" + g.usage_category
+                       + "» в усіх USP…",
+                title: "Смуга спільна для кількох USP — перейменується скрізь",
+                fn: function () { startBucketEdit(g, "rename"); }});
+    items.push({label: "🚫 Без usage-групи",
+                title: "USP піде у смугу за замовчуванням",
+                fn: function () {
+                  emit("set_usage_category", {group: g.id, bucket: ""});
+                }});
+  }
+  openMenu(x, y, items);
+}
+
+function startBucketEdit(g, mode) {
+  if (mini.has(g.id)) { mini.delete(g.id); render(); }
+  const el = document.querySelector('[data-ucat="' + g.id + '"]');
+  if (!el) return;
+  const head = el.closest(".col-head");
+  if (head) head.draggable = false;      // contenteditable and draggable fight
+  el.classList.remove("none");
+  editable(el, mode === "rename" ? g.usage_category : "", function (txt) {
+    if (head) head.draggable = true;
+    if (!txt || txt === g.usage_category) { render(); return; }
+    if (mode === "rename") {
+      emit("rename_usage_bucket", {group: g.id, old: g.usage_category,
+                                   name: txt});
+    } else {
+      emit("set_usage_category", {group: g.id, bucket: txt});
+    }
+  });
+}
+
+function startGroupRename(g) {
+  // a collapsed header has no editable name node — open it first, otherwise
+  // the menu item would look like it did nothing
+  if (mini.has(g.id)) { mini.delete(g.id); render(); }
+  const el = document.querySelector('[data-gname="' + g.id + '"]');
+  if (!el) return;
+  const head = el.closest(".col-head");
+  if (head) head.draggable = false;   // contenteditable and draggable fight
+  editable(el, g.name, function (txt) {
+    if (head) head.draggable = true;
+    if (txt && txt !== g.name) emit("rename_group", {group: g.id, name: txt});
+    else render();
+  });
+}
+
+function column(g) {
+  const col = document.createElement("div");
+  const rows = visibleRows(g);
+  const collapsed = mini.has(g.id);
+  // a column the filter emptied is faded, never removed: it still has to be a
+  // drop target, otherwise the filter hides where you want to drag TO
+  col.className = "col" + (collapsed ? " mini" : "")
+                + (filter.trim() && !rows.length ? " dim" : "");
+
+  // ---- header: drag source (merge USP) + drop target (merge USP / move rows)
+  const head = document.createElement("div");
+  head.className = "col-head";
+  head.draggable = true;
+  head.oncontextmenu = function (ev) {
+    ev.preventDefault();
+    groupMenu(g, ev.clientX, ev.clientY);
+  };
+  wireHeadDrag(head, g);
+
+  if (collapsed) {
+    head.appendChild(icon("⇥", "Розгорнути колонку", function () {
+      mini.delete(g.id);
+      render();
+    }));
+    const nm = document.createElement("div");
+    nm.className = "mini-name";
+    nm.textContent = g.name;
+    nm.title = groupLabel(g) + " — клік, щоб розгорнути";
+    nm.onclick = function () { mini.delete(g.id); render(); };
+    head.appendChild(nm);
+    const tot = document.createElement("div");
+    tot.className = "mini-tot";
+    tot.textContent = g.total;
+    head.appendChild(tot);
+    col.appendChild(head);
+    return col;
+  }
+
+  const title = document.createElement("div");
+  title.className = "col-title";
+  // select-all: fastest way to grab a whole USP and move it phrase by phrase
+  const allOn = rows.length > 0 && rows.every(r => sel.has(r.id));
+  const all = document.createElement("span");
+  all.className = "cb" + (allOn ? " on" : "");
+  all.textContent = allOn ? "☑" : "☐";
+  all.title = allOn ? "Зняти виділення з колонки"
+                    : "Виділити всі фрази колонки";
+  all.onclick = function (ev) {
+    ev.stopPropagation();
+    rows.forEach(r => { if (allOn) sel.delete(r.id); else sel.add(r.id); });
+    anchor = rows.length ? rows[rows.length - 1].id : anchor;
+    render();
+  };
+  title.appendChild(all);
+  const name = document.createElement("div");
+  name.className = "col-name";
+  name.textContent = g.name;
+  name.setAttribute("data-gname", g.id);
+  name.title = "Подвійний клік — перейменувати";
+  name.ondblclick = function (ev) {
+    ev.stopPropagation();
+    startGroupRename(g);
+  };
+  title.appendChild(name);
+  title.appendChild(icon("⇤", "Згорнути колонку", function () {
+    mini.add(g.id);
+    render();
+  }));
+  title.appendChild(icon("⋯", "Дії з цією USP", function (ev) {
+    groupMenu(g, ev.clientX, ev.clientY);
+  }));
+  head.appendChild(title);
+
+  const meta = document.createElement("div");
+  meta.className = "col-meta";
+  // three different "hidden" states can overlap: hidden by the vote threshold
+  // (payload) and hidden by the text filter (here) — say which is which
+  const total = g.rows.length + (g.hidden || 0);
+  let shown = String(g.rows.length);
+  if (filter.trim() && rows.length !== g.rows.length) {
+    shown = rows.length + " з " + g.rows.length;
+  } else if (g.hidden) {
+    shown = g.rows.length + " з " + total;
+  }
+  // the usage band is the one thing about a USP that only shows up in Excel —
+  // give it a chip that says what it is, including when it is MISSING
+  if (DATA.has_bucket) meta.appendChild(bucketChip(g));
+  const counts = document.createElement("span");
+  counts.innerHTML = shown + " фраз · <b>" + g.total + "</b> голосів";
+  meta.appendChild(counts);
+  head.appendChild(meta);
+
+  const bar = document.createElement("div");
+  bar.className = "bar";
+  bar.title = "Частка голосів цієї USP від найбільшої в категорії";
+  bar.innerHTML = '<i style="width:'
+    + Math.round(100 * (g.total || 0) / MAXTOT) + '%"></i>';
+  head.appendChild(bar);
+
+  col.appendChild(head);
+
+  // ---- body: drop target for phrase cards
+  const body = document.createElement("div");
+  body.className = "col-body";
+  if (!rows.length) {
+    const e = document.createElement("div");
+    e.className = "empty";
+    e.textContent = filter.trim() ? "— немає збігів з фільтром —"
+                  : g.hidden ? "— усі фрази сховано порогом голосів —"
+                  : "— порожньо, киньте сюди фрази —";
+    body.appendChild(e);
+  }
+  rows.forEach(r => body.appendChild(card(r, rows)));
+
+  body.addEventListener("dragover", function (ev) {
+    if (!drag || drag.kind !== "rows") return;
+    ev.preventDefault();
+    body.classList.add("over");
+  });
+  body.addEventListener("dragleave", function () {
+    body.classList.remove("over");
+  });
+  body.addEventListener("drop", function (ev) {
+    ev.preventDefault();
+    body.classList.remove("over");
+    stopAuto();
+    if (!drag || drag.kind !== "rows") return;
+    emit("move_rows", {rows: drag.ids, to_group: g.id});
+    drag = null;
+  });
+  col.appendChild(body);
+  return col;
+}
+
+// text with the filter match lit up — scanning a 300px column for the word you
+// typed is exactly the work a highlight removes
+function paint(el, text) {
+  const q = filter.trim();
+  if (!q) { el.textContent = text; return; }
+  const low = text.toLowerCase(), needle = q.toLowerCase();
+  let out = "", i = 0, k = low.indexOf(needle);
+  while (k >= 0) {
+    out += esc(text.slice(i, k)) + '<mark class="hi">'
+         + esc(text.slice(k, k + needle.length)) + "</mark>";
+    i = k + needle.length;
+    k = low.indexOf(needle, i);
+  }
+  el.innerHTML = out + esc(text.slice(i));
+}
+
+// the row's own menu: same seven operations, zero pixel precision required
+function rowMenu(r, x, y) {
+  const ids = selectedOr(r.id);
+  const many = ids.length > 1;
+  const home = DATA.groups.find(g => g.rows.some(x2 => x2.id === r.id));
+  const targets = DATA.groups.filter(g => !home || g.id !== home.id);
+  const back = function () { rowMenu(r, x, y); };
+  // merge candidates: same USP first (the usual case), then everything else
+  const near = [], far = [];
+  DATA.groups.forEach(function (g) {
+    g.rows.forEach(function (o) {
+      if (ids.indexOf(o.id) >= 0) return;
+      (home && g.id === home.id ? near : far).push({g: g, r: o});
+    });
+  });
+  const rank = (a, b) => b.r.total - a.r.total;
+  near.sort(rank);
+  far.sort(rank);
+  openMenu(x, y, [
+    {head: many ? "Дії з " + ids.length + " виділеними" : "Дії з фразою"},
+    {label: "📦 Перенести в іншу USP…", disabled: !targets.length,
+     fn: function () {
+       subMenu(x, y, "Перенести в:", back,
+         targets.map(g => ({label: groupLabel(g), fn: function () {
+           emitClear("move_rows", {rows: ids, to_group: g.id});
+         }})));
+     }},
+    {label: "🔗 Злити з іншою фразою…", disabled: !(near.length + far.length),
+     fn: function () {
+       const item = e => ({
+         label: e.r.text + "  (Σ" + e.r.total + ")",
+         title: e.g.name + " · " + e.r.text,
+         fn: function () { emitClear("merge_rows", {rows: ids, into: e.r.id}); }});
+       let items = near.map(item);
+       if (far.length) {
+         items = items.concat([{head: "інші USP"}],
+                              far.slice(0, 40).map(item));
+       }
+       subMenu(x, y, "Влити " + (many ? ids.length + " фрази" : "фразу") + " в:",
+               back, items);
+     }},
+    {label: many ? "🔗 Злити виділені в один рядок" : "🔗 Злити виділені",
+     disabled: !many,
+     title: many ? "" : "Виділіть щонайменше дві фрази",
+     fn: function () {
+       let into = ids[0];
+       ids.forEach(function (id) {
+         if (ROWS[id] && ROWS[into] && ROWS[id].total > ROWS[into].total)
+           into = id;
+       });
+       emitClear("merge_rows", {rows: ids, into: into});
+     }},
+    {label: "➕ Нова USP з " + (many ? "виділених" : "цієї фрази"),
+     fn: function () { emitClear("new_group", {rows: ids}); }},
+    {sep: true},
+    {label: "🔍 Сирі цитати", disabled: many,
+     title: many ? "Працює для однієї фрази" : "",
+     fn: function () { emit("inspect", {row: r.id}); }},
+    {label: "✏️ Переписати формулювання", disabled: many,
+     title: many ? "Працює для однієї фрази" : "",
+     fn: function () { startRowRename(r); }},
+    {sep: true},
+    {label: sel.has(r.id) ? "☐ Зняти виділення" : "☑ Виділити",
+     fn: function () {
+       if (sel.has(r.id)) sel.delete(r.id); else sel.add(r.id);
+       anchor = r.id;
+       render();
+     }},
+  ]);
+}
+
+function startRowRename(r) {
+  const el = document.querySelector('[data-rtext="' + r.id + '"]');
+  if (!el) return;
+  const c = el.closest(".card");
+  if (c) c.draggable = false;
+  editable(el, r.text, function (v) {
+    if (c) c.draggable = true;
+    if (v && v !== r.text) emit("rename_row", {row: r.id, text: v});
+    else render();
+  });
+}
+
+function card(r, rows) {
+  const c = document.createElement("div");
+  const on = sel.has(r.id);
+  c.className = "card" + (on ? " sel" : "")
+              + (DATA.inspect === r.id ? " insp" : "");
+  c.draggable = true;
+
+  const top = document.createElement("div");
+  top.className = "card-top";
+  const box = document.createElement("span");
+  box.className = "cb" + (on ? " on" : "");
+  box.textContent = on ? "☑" : "☐";
+  box.title = "Виділити (Shift — діапазон)";
+  box.onclick = function (ev) {
+    ev.stopPropagation();      // the card's own onclick would undo this
+    toggleRow(r.id, rows, ev.shiftKey);
+  };
+  top.appendChild(box);
+  const txt = document.createElement("div");
+  txt.className = "card-text";
+  txt.setAttribute("data-rtext", r.id);
+  txt.title = "Подвійний клік — переписати формулювання";
+  paint(txt, r.text);
+  txt.ondblclick = function (ev) {
+    ev.stopPropagation();
+    startRowRename(r);
+  };
+  top.appendChild(txt);
+  c.appendChild(top);
+
+  const foot = document.createElement("div");
+  foot.className = "card-foot";
+  const tot = document.createElement("span");
+  tot.className = "tot";
+  tot.textContent = "Σ " + r.total;
+  foot.appendChild(tot);
+  // a line can carry a dozen products — show the loudest few, keep the rest
+  // in the tooltip so cards stay short enough to drag comfortably
+  const votes = Object.keys(r.votes || {})
+    .filter(function (p) { return r.votes[p]; })
+    .sort(function (a, b) { return r.votes[b] - r.votes[a]; });
+  votes.slice(0, 4).forEach(function (p) {
+    const ch = document.createElement("span");
+    ch.className = "chip";
+    ch.textContent = p + " " + r.votes[p];
+    foot.appendChild(ch);
+  });
+  if (votes.length > 4) {
+    const more = document.createElement("span");
+    more.className = "chip";
+    more.textContent = "+" + (votes.length - 4);
+    more.title = votes.slice(4)
+      .map(function (p) { return p + " " + r.votes[p]; }).join(", ");
+    foot.appendChild(more);
+  }
+  c.appendChild(foot);
+  // actions live on their own row: in the footer they drifted left or right
+  // depending on how many product chips wrapped, and moving targets are slow
+  const acts = document.createElement("div");
+  acts.className = "card-acts";
+  acts.appendChild(icon("🔍", "Сирі цитати, злиті в цю фразу", function () {
+    emit("inspect", {row: r.id});
+  }));
+  acts.appendChild(icon("✏️", "Переписати формулювання", function () {
+    startRowRename(r);
+  }));
+  acts.appendChild(icon("⋯", "Усі дії з фразою (або права кнопка миші)",
+    function (ev) { rowMenu(r, ev.clientX, ev.clientY); }));
+  c.appendChild(acts);
+
+  c.onclick = function (ev) {
+    if (ev.target.classList.contains("icon")) return;
+    if (txt.contentEditable === "true") return;
+    toggleRow(r.id, rows, ev.shiftKey);
+  };
+  c.oncontextmenu = function (ev) {
+    ev.preventDefault();
+    rowMenu(r, ev.clientX, ev.clientY);
+  };
+
+  c.addEventListener("dragstart", function (ev) {
+    drag = {kind: "rows", ids: selectedOr(r.id)};
+    ev.dataTransfer.effectAllowed = "move";
+    ev.dataTransfer.setData("text/plain", drag.ids.join(","));
+    c.classList.add("drag");
+    startAuto();
+  });
+  c.addEventListener("dragend", function () {
+    drag = null;
+    stopAuto();
+    render();
+  });
+  c.addEventListener("dragover", function (ev) {
+    if (!drag || drag.kind !== "rows" || drag.ids.indexOf(r.id) >= 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    c.classList.add("over");
+  });
+  c.addEventListener("dragleave", function () { c.classList.remove("over"); });
+  c.addEventListener("drop", function (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    c.classList.remove("over");
+    stopAuto();
+    if (!drag || drag.kind !== "rows" || drag.ids.indexOf(r.id) >= 0) return;
+    emit("merge_rows", {rows: drag.ids, into: r.id});
+    drag = null;
+  });
+  return c;
+}
+
+function newZone() {
+  const z = document.createElement("div");
+  z.className = "newzone";
+  z.innerHTML = sel.size
+    ? "➕<br>Нова USP<br><span class='hint'>клік — з " + sel.size
+      + " виділених<br>або киньте сюди фрази</span>"
+    : "➕<br>Нова USP<br><span class='hint'>киньте сюди фрази</span>";
+  if (sel.size) {
+    z.style.cursor = "pointer";
+    z.onclick = function () { emitClear("new_group", {rows: Array.from(sel)}); };
+  }
+  z.addEventListener("dragover", function (ev) {
+    if (!drag || drag.kind !== "rows") return;
+    ev.preventDefault();
+    z.classList.add("over");
+  });
+  z.addEventListener("dragleave", function () { z.classList.remove("over"); });
+  z.addEventListener("drop", function (ev) {
+    ev.preventDefault();
+    z.classList.remove("over");
+    stopAuto();
+    if (!drag || drag.kind !== "rows") return;
+    emit("new_group", {rows: drag.ids});
+    drag = null;
+  });
+  return z;
+}
+
+// inline rename: contenteditable, Enter commits, Escape cancels, blur commits
+function editable(el, original, done) {
+  el.textContent = original;   // drop any filter <mark> markup before editing
+  el.contentEditable = "true";
+  el.focus();
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const s = window.getSelection();
+  s.removeAllRanges();
+  s.addRange(range);
+  let closed = false;
+  function finish(commit) {
+    if (closed) return;
+    closed = true;
+    el.contentEditable = "false";
+    const v = (el.textContent || "").trim();
+    done(commit ? v : "");
+  }
+  el.onkeydown = function (ev) {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    else if (ev.key === "Escape") { el.textContent = original; finish(false); }
+  };
+  el.onblur = function () { finish(true); };
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, function (ch) {
+    return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[ch];
+  });
+}
+
+send("streamlit:componentReady", {apiVersion: 1});
+</script>
+</body>
+</html>

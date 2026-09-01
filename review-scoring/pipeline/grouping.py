@@ -803,6 +803,67 @@ def _dedupe_canonical_into(tax: Taxonomy, keep, other) -> None:
     del tax.canonicals[other.id]
 
 
+def find_quote_key(canon, quote: str) -> tuple[str, str] | None:
+    """(product, exact key) of `quote` inside `canon.quote_sources`, or None.
+    `quote_sources` is the complete per-review pairing (grouping records every
+    (review_id, quote) pair), unlike `quotes`, which keeps at most 3 joined
+    samples for display."""
+    want = normalize(quote)
+    for product, smap in canon.quote_sources.items():
+        for q in smap:
+            if normalize(q) == want:
+                return product, q
+    return None
+
+
+def _refresh_quote_sample(canon, product: str) -> None:
+    """Rebuild the display sample `quotes[product]` from what is left in
+    quote_sources — entries there are "; "-joined triples, so a raw quote can
+    never simply be list-removed."""
+    keys = list(canon.quote_sources.get(product, {}))
+    if keys:
+        canon.quotes[product] = ["; ".join(keys[:3])]
+    else:
+        canon.quotes.pop(product, None)
+
+
+def move_quote_between(tax: Taxonomy, src, dst, quote: str) -> int:
+    """Detach one RAW review quote from `src` and hand it — together with the
+    reviews that actually said it — to `dst`.
+
+    Votes follow the reviews: a review stays in `src` only while some other
+    surviving quote of that row still carries it. Returns how many reviews
+    moved. `src` may be left with zero votes; the caller prunes."""
+    want = normalize(quote)
+    moved = 0
+    for product, smap in list(src.quote_sources.items()):
+        key = next((q for q in smap if normalize(q) == want), None)
+        if key is None:
+            continue
+        rids = list(smap.pop(key))
+        if not smap:
+            src.quote_sources.pop(product, None)
+        had_ids = bool(src.review_ids.get(product))
+        # a review whose OTHER quotes still sit in this row keeps its vote here
+        still = {r for lst in src.quote_sources.get(product, {}).values()
+                 for r in lst}
+        src.review_ids[product] = [r for r in src.review_ids.get(product, [])
+                                   if r in still or r not in rids]
+        if had_ids:
+            # reconcile_votes skips cells whose id list went empty, so the
+            # count has to be zeroed here or the emptied row keeps ghost votes
+            src.votes[product] = len(src.review_ids[product])
+        _refresh_quote_sample(src, product)
+        if dst is not None:
+            for rid in rids:
+                dst.add(product, 1, key, [rid], [(rid, key)])
+            if dst.review_ids.get(product):
+                dst.votes[product] = len(dst.review_ids[product])
+            _refresh_quote_sample(dst, product)
+        moved += len(rids)
+    return moved
+
+
 def _relocate_canonical(tax: Taxonomy, canon, target_group) -> None:
     """Move `canon` into `target_group`. If the target already holds a
     canonical with the same normalized text, it's that same vote's
@@ -1760,7 +1821,15 @@ def apply_overrides(tax: Taxonomy, path: Path) -> None:
                             "rows": ["He designated it as his litter box",
                                      "immediately started using it to potty"]}],
       "dual_place":       [{"quote": "raw review quote naming two benefits",
-                            "rows": ["Row A canonical text", "Row B canonical text"]}]
+                            "rows": ["Row A canonical text", "Row B canonical text"]}],
+      "move_quote":       [{"quote": "raw review quote sitting in the wrong row",
+                            "from": "Row it was grouped into",
+                            "to": "Row it belongs to (created if missing)",
+                            "group": "USP for the new row (optional)"}],
+      "drop_quote":       [{"quote": "raw review quote that is noise",
+                            "from": "Row it was grouped into"}],
+      "usage_category":   {"Group name": "Coarse bucket band (Usage sheet)",
+                           "Another group": ""}
     }
     Applied after grouping on every run — corrections survive reruns.
 
@@ -1779,6 +1848,13 @@ def apply_overrides(tax: Taxonomy, path: Path) -> None:
     it. This is how a human fixes a mega-group the automated split pass
     (grouping.split_groups) missed or under-split, in a way that survives
     every subsequent run.
+
+    usage_category re-bands a group on a relation sheet (the coarse bucket
+    shown as a band above the USPs — `subbucket` categories only). Applied
+    LAST, after every rule that can rename, merge or CREATE a group, so a
+    bucket set on a hand-carved USP still finds its group. An empty value is
+    a real instruction ("no bucket of its own" — the sheet falls back to the
+    category's `bucket_labels` band), not a no-op.
 
     dual_place counts ONE review in two canonical rows (typically two rows of
     the same USP group, e.g. a quote naming both "an emergency" and a "first
@@ -1829,6 +1905,11 @@ def apply_overrides(tax: Taxonomy, path: Path) -> None:
                 continue
             for c in list(other.canonicals(tax)):
                 _relocate_canonical(tax, c, keep)
+            # same rule as the live merge (_merge_group_into): the bucket of a
+            # retired group is not thrown away when the survivor has none —
+            # otherwise a merge done on the board loses its band on replay
+            if other.usage_category and not keep.usage_category:
+                keep.usage_category = other.usage_category
             del tax.groups[other.id]
 
     for text, target_name in ov.get("move_canonical", {}).items():
@@ -1905,3 +1986,64 @@ def apply_overrides(tax: Taxonomy, path: Path) -> None:
             if rid in c.review_ids.get(product, []):
                 continue    # already counted here — don't double-add
             c.add(product, 1, quote, [rid], [(rid, quote)])
+
+    # LAST: a raw quote the grouping put in the wrong row is pulled out of it
+    # and given to another row (or to a row of its own). Runs after every rule
+    # that merges or renames rows, so `from`/`to` name the FINAL wordings.
+    for spec in ov.get("move_quote", []):
+        quote = (spec.get("quote") or "").strip()
+        from_text = (spec.get("from") or "").strip()
+        to_text = (spec.get("to") or "").strip()
+        if not quote or not from_text or not to_text:
+            continue
+        source = find_canonical(from_text)
+        # nothing to move (already replayed, or the row is gone) — never create
+        # the destination row on spec alone, that would leave a voteless ghost
+        if source is None or find_quote_key(source, quote) is None:
+            continue
+        cat = canonical_category(source)
+        target = next((c for c in tax.canonicals.values()
+                       if c.id != source.id and canonical_category(c) == cat
+                       and normalize(c.text) == normalize(to_text)), None)
+        if target is None:
+            gname = (spec.get("group") or "").strip()
+            grp = find_group_in(gname, cat) if gname else None
+            if grp is None:
+                grp = (tax.new_group(cat, gname) if gname
+                       else tax.groups.get(source.group_id))
+            if grp is None:
+                continue
+            target = tax.new_canonical(to_text, grp.id)
+        move_quote_between(tax, source, target, quote)
+        if source.total == 0:
+            del tax.canonicals[source.id]
+            g = tax.groups.get(source.group_id)
+            if g is not None and not g.canonicals(tax):
+                del tax.groups[g.id]
+
+    # right after the moves: quotes the user threw out of the analysis. Order
+    # matters — a quote that was first moved and then dropped names its NEW row
+    # in `from`, which is the row that exists at this point of the replay.
+    for spec in ov.get("drop_quote", []):
+        quote = (spec.get("quote") or "").strip()
+        from_text = (spec.get("from") or "").strip()
+        if not quote or not from_text:
+            continue
+        source = find_canonical(from_text)
+        # already replayed, or the row is gone — nothing left to drop
+        if source is None or find_quote_key(source, quote) is None:
+            continue
+        move_quote_between(tax, source, None, quote)
+        if source.total == 0:
+            del tax.canonicals[source.id]
+            g = tax.groups.get(source.group_id)
+            if g is not None and not g.canonicals(tax):
+                del tax.groups[g.id]
+
+    # LAST of all: the coarse bucket band. Every group-creating rule above has
+    # run by now, so a bucket set on a hand-carved USP resolves. "" is applied
+    # as-is — clearing a bucket the LLM invented is a correction too.
+    for name, bucket in ov.get("usage_category", {}).items():
+        g = find_group(name)
+        if g is not None:
+            g.usage_category = (bucket or "").strip()

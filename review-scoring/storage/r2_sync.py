@@ -12,6 +12,11 @@ persistence layer: local disk is treated as a per-process cache.
 - Every write path in app.py pushes the changed file(s) back up right
   after writing them locally.
 
+- SQLite journal siblings (`-wal`/`-shm`/`-journal`) are never shipped and
+  never pulled (`is_sidecar`), and an existing local `.db` is never
+  overwritten by the remote copy — see the `_SIDECARS` note and
+  `tests/test_r2_sync.py`.
+
 If no `[r2]` section exists in `st.secrets`, every function here is a
 no-op — the app then behaves exactly as before (local-disk-only), so R2
 stays optional for local development.
@@ -75,10 +80,23 @@ def _key(local_path: Path, root: Path) -> str:
 
 MAX_BUCKET_BYTES = 1_000_000_000  # ~1GB — Cloudflare R2 free-tier storage cap
 
+# SQLite journal siblings are per-connection scratch, not data: shipping them
+# is useless (DB.checkpoint() folds every commit back into the .db before any
+# upload) and actively harmful — Windows keeps `-wal`/`-shm` locked for as long
+# as a connection is open, so pulling them back down crashes the whole folder
+# sync with WinError 32, and a `-wal` restored next to a DIFFERENT .db is a
+# corruption source. Never uploaded, never downloaded.
+_SIDECARS = ("-wal", "-shm", "-journal")
+
+
+def is_sidecar(path: Path | str) -> bool:
+    name = Path(path).name
+    return any(name.endswith(s) for s in _SIDECARS)
+
 
 def _put(local_path: Path, root: Path) -> None:
     client = _get_client()
-    if client is None or not local_path.exists():
+    if client is None or not local_path.exists() or is_sidecar(local_path):
         return
     try:
         client.upload_file(str(local_path), _bucket, _key(local_path, root))
@@ -117,8 +135,14 @@ def upload_folder(local_folder: Path, root: Path) -> int:
     if client is None:
         return 0
     for p in local_folder.rglob("*"):
-        if p.is_file():
-            _put(p, root)
+        if not p.is_file():
+            continue
+        if is_sidecar(p):
+            # an older build DID ship these; drop the stale object so the next
+            # sync_folder_down has nothing locked to trip over
+            delete_file(p, root)
+            continue
+        _put(p, root)
     return enforce_retention(root)
 
 
@@ -150,6 +174,12 @@ def enforce_retention(root: Path, max_bytes: int = MAX_BUCKET_BYTES) -> int:
             (root / obj["Key"]).unlink()
         except FileNotFoundError:
             pass
+        except OSError as e:
+            # Windows: the local copy is an open sqlite file. The R2 object is
+            # already gone, which is what retention is about — keeping the
+            # local one is harmless, crashing the rerun is not.
+            print(f"[r2_sync] could not remove local {obj['Key']}: {e}",
+                  file=sys.stderr)
         total -= obj["Size"]
         evicted += 1
     return evicted
@@ -162,7 +192,7 @@ def sync_file_down(local_path: Path, root: Path) -> None:
     that empty file would win once a connection is bound to it. Only once
     per process per path."""
     client = _get_client()
-    if client is None:
+    if client is None or is_sidecar(local_path):
         return
     key = _key(local_path, root)
     with _lock:
@@ -193,20 +223,39 @@ def sync_folder_down(local_folder: Path, root: Path) -> None:
         if prefix in _synced_prefixes:
             return
     local_folder.mkdir(parents=True, exist_ok=True)
+    failed = 0
     try:
         paginator = client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=_bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if key.endswith("/"):
+                if key.endswith("/") or is_sidecar(key):
                     continue
                 dest = root / key
                 if dest.exists() and dest.stat().st_size == obj["Size"]:
                     continue  # already present (warm process, repeated rerun)
+                if dest.exists() and dest.suffix == ".db":
+                    # a db that already exists locally is the one this process
+                    # has open and has been writing to — it is AHEAD of R2, not
+                    # behind it. Overwriting it under a live connection loses
+                    # those writes (and on Windows just fails outright).
+                    continue
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                client.download_file(_bucket, key, str(dest))
+                try:
+                    client.download_file(_bucket, key, str(dest))
+                except Exception as e:
+                    # one unwritable file must not abort the folder: the rest
+                    # of the product line still has to arrive
+                    failed += 1
+                    print(f"[r2_sync] download failed for {key}: {e}",
+                          file=sys.stderr)
     except Exception as e:
         print(f"[r2_sync] sync_folder_down failed for {prefix}: {e}",
+              file=sys.stderr)
+        return
+    if failed:
+        # leave the prefix unmarked so a later call in this process retries
+        print(f"[r2_sync] {prefix}: {failed} file(s) not synced — will retry",
               file=sys.stderr)
         return
     with _lock:

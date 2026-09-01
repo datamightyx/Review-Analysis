@@ -201,7 +201,7 @@ class LLM:
     # ---------- public ----------
 
     async def json_call_async(self, system: str, user: str, schema: dict,
-                              max_tokens: int = 16000) -> dict:
+                              max_tokens: int = 32000) -> dict:
         """Cache lookup, then the provider call under the shared per-loop
         concurrency semaphore. The sqlite cache get/put are sub-ms and run
         directly on the loop (the DB layer is lock-guarded)."""
@@ -230,7 +230,7 @@ class LLM:
         return result
 
     def json_call(self, system: str, user: str, schema: dict,
-                  max_tokens: int = 16000) -> dict:
+                  max_tokens: int = 32000) -> dict:
         """Sync facade over json_call_async for one-off callers (quote
         repair, calibrate). Must not be called from inside a running event
         loop — the concurrent passes await json_call_async directly."""

@@ -22,7 +22,7 @@ extract_model: anthropic/claude-haiku-4.5
 # Глибина міркувань (extended thinking): low | medium | high.
 # Діє для обох провайдерів; якщо модель на OpenRouter не підтримує
 # reasoning — параметр автоматично відкидається.
-effort: high
+effort: medium
 # Окремий (нижчий) effort для екстракції — просте слідування правилам,
 # а не нюансоване судження, тож глибокі міркування там менш потрібні.
 # Порожньо/відсутнє = той самий effort, що й `effort` вище.
@@ -108,7 +108,7 @@ row_merge: true      # LLM-пас злиття рядків-синонімів �
 # викликів на прогін по всій таксономії, тож майже нічого не коштує.
 # Порожньо/відсутнє = model / effort вище.
 # consolidate_model: anthropic/claude-opus-4.8
-consolidate_effort: high
+consolidate_effort: medium
 
 # Зворотний зв'язок для гейта злиття: вердикти ✓/✗ з вкладки «Перевірити»
 # (gate_labels.json) діють на наступних прогонах трьома шарами:

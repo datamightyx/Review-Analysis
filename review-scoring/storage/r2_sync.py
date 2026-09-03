@@ -107,13 +107,22 @@ def _put(local_path: Path, root: Path) -> None:
         print(f"[r2_sync] upload failed for {local_path}: {e}", file=sys.stderr)
 
 
-def upload_file(local_path: Path, root: Path) -> int:
-    """Push one file to R2 under its path relative to `root`, then enforce
-    the bucket-wide size cap. No-op if R2 isn't configured, or the file no
-    longer exists (use delete_file for a removed file). Returns how many
-    (oldest) objects got evicted to stay under the cap."""
+def upload_file(local_path: Path, root: Path, retention: bool = False) -> int:
+    """Push one file to R2 under its path relative to `root`. No-op if R2
+    isn't configured, or the file no longer exists (use delete_file for a
+    removed file). Returns how many (oldest) objects got evicted to stay
+    under the cap — 0 unless `retention` is asked for.
+
+    Retention is OFF by default: enforce_retention lists the WHOLE bucket,
+    which is far too expensive to run behind an interactive write. Every
+    board edit uploads twice (overrides.json + scoring.db), so the cap used
+    to cost two full-bucket paginations per click — that was the visible
+    lag on a merge/move. Those writes cannot grow the bucket anyway: they
+    overwrite keys that already exist. New objects only arrive with a
+    pipeline run, and upload_folder still enforces the cap at the end of
+    one."""
     _put(local_path, root)
-    return enforce_retention(root)
+    return enforce_retention(root) if retention else 0
 
 
 def delete_file(local_path: Path, root: Path) -> None:

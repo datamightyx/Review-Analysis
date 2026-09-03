@@ -61,6 +61,41 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_PLURAL_ES = ("ses", "xes", "zes", "ches", "shes")
+
+
+def _fold_token(t: str) -> str:
+    if len(t) > 4 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 4 and t.endswith(_PLURAL_ES):
+        return t[:-2]
+    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        return t[:-1]
+    return t
+
+
+def fold_label(text: str) -> str:
+    """normalize() plus a conservative per-token fold of grammatical number.
+
+    For a LABEL — a usage relation ("gerbil" / "gerbils"), a wish gist
+    ("bigger amount" / "bigger amounts"), a group name — the singular and the
+    plural are the same thing, and keeping both produces two rows or two
+    groups with separate subtotals. normalize() cannot do this itself: it
+    keys the exact-match maps and has to stay stable.
+
+    Deliberately NOT a stemmer. Only regular plural endings fold, never on a
+    token short enough for the ending to BE the word ("is", "as"), never on a
+    double-s ending ("glass", "less"), and irregular plurals ("mice",
+    "people") are left alone. A missed merge costs one extra row; a wrong one
+    corrupts a count.
+
+    Never call this on a verbatim customer wording — there the exact phrasing
+    is the product of the analysis, which is why the merge gate works on
+    _prepare_flag() instead.
+    """
+    return " ".join(_fold_token(t) for t in normalize(text).split())
+
+
 def _prepare_flag(text: str) -> tuple[str, bool]:
     """normalize() plus contraction expansion and idiom mapping — the form
     all token/gate logic works on (normalize() itself stays stable: it keys

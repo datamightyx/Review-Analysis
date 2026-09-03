@@ -172,8 +172,16 @@ def _write_wish_sheet(ws, tax: Taxonomy, category: str,
                 a = ws.cell(row=row, column=1, value=product)
                 a.font = DETAIL_FONT
                 a.alignment = Alignment(vertical="center")
+                # first row of the group carries the THEME label, the rest
+                # their own wording — the same two-level reading as column A
+                # of the Positive/Negative sheets. Written explicitly rather
+                # than by comparing canon.text to group.name: once a category
+                # is named from its `gist` label (domain.yaml name_from) the
+                # two never match, and the theme label appeared nowhere on
+                # the sheet.
                 b = ws.cell(row=row, column=2,
-                            value=group.name if canon.text == group.name else canon.text)
+                            value=group.name if row == group_first
+                            else canon.text)
                 b.font = DETAIL_FONT
                 b.alignment = Alignment(wrap_text=True, vertical="center")
                 c = ws.cell(row=row, column=3, value=sample)
@@ -197,8 +205,16 @@ def write_workbook(tax: Taxonomy, products: dict[str, str],
     """products: short name -> link (for the Products sheet). The sheet
     layout is driven by the active domain profile (pipeline/domain.py);
     the default profile reproduces the reference workbook exactly."""
-    from .grouping import reconcile_votes   # local: avoids import cycle
-    reconcile_votes(tax)   # one review = one vote, on every write path
+    # local imports: avoid an import cycle with grouping
+    from .grouping import (dedupe_group_names, fold_relation_rows,
+                           reconcile_votes)
+    # order matters: merging groups first brings number-variant rows of one
+    # label into the same group, where fold_relation_rows can see them;
+    # reconcile_votes runs last so every count is rebuilt from the review ids
+    # the two merges left behind
+    dedupe_group_names(tax)   # one theme = one group,  on every write path
+    fold_relation_rows(tax)   # one label = one row,    on every write path
+    reconcile_votes(tax)      # one review = one vote,  on every write path
     dom = _domain.active()
     wb = Workbook()
     first = True

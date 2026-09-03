@@ -9,9 +9,12 @@ module runs the same three checks automatically before every save.
 """
 from __future__ import annotations
 
+from collections import defaultdict
+
 from .models import Taxonomy
 from . import domain as _domain
 from .grouping import polarity_conflicts
+from .similarity import fold_label
 
 TOP_GROUP_SHARE = 0.15     # a group holding >=15% of its category is suspect
 BIG_GROUP_ROWS = 30        # matches the old consolidate_taxonomy blind spot
@@ -30,6 +33,20 @@ def workbook_warnings(tax: Taxonomy) -> list[str]:
         if not groups:
             continue
         cat_total = sum(g.total(tax) for g in groups) or 1
+        # same-named groups: grouping.dedupe_group_names merges them on the
+        # way into the workbook, so this line explains a group count that
+        # dropped between the board and the saved file. Keyed on fold_label,
+        # exactly like the merge it announces — on normalize() a number
+        # variant ("Chinchilla" / "Chinchillas") would be merged silently.
+        by_name: dict[str, int] = defaultdict(int)
+        for g in groups:
+            by_name[fold_label(g.name)] += 1
+        for g in groups:
+            if by_name[fold_label(g.name)] > 1:
+                warnings.append(
+                    f"[{cat}] «{g.name}» — {by_name[fold_label(g.name)]} груп "
+                    f"з однією назвою; їх буде злито в одну при збереженні")
+                by_name[fold_label(g.name)] = 1     # report each name once
         singletons = 0
         for g in groups:
             total = g.total(tax)

@@ -21,8 +21,9 @@ from pathlib import Path
 
 from .llm import LLM, run_async
 from .models import ExtractedPhrase, Group, Taxonomy
-from .similarity import (auto_merge_target, merge_blocked, normalize,
-                         polarity_conflict, similarity, top_candidates)
+from .similarity import (auto_merge_target, fold_label, merge_blocked,
+                         normalize, polarity_conflict, similarity,
+                         top_candidates)
 from . import embeddings
 from . import precedents
 from . import domain as _domain
@@ -179,6 +180,42 @@ ANSWER PROTOCOL (strict):
 Be consistent: identical inputs must produce identical decisions.
 """
 
+# Universal placement rules. Product-agnostic like _GROUPING_BASE (they turn
+# on the strength and direction of a claim, never on any product's
+# vocabulary), but shown to EVERY judge that places or re-places a phrase:
+# grouping, consolidation, reassignment and splitting. A rule only one pass
+# sees is a rule the next pass undoes — the same reason _judge_examples_block
+# is appended everywhere.
+#
+# Both rules are defect classes measured against a human-scored workbook for
+# the same product line: an illness filed under the group naming the extreme
+# outcome, a mechanism invented for a bare "it made him sick", and a
+# complaint that the product clumps TOO hard filed under the "does not clump"
+# theme. Domain vocabulary for these readings belongs in domain.yaml
+# judge_examples; the grammar of the mistake is universal and lives here.
+_PLACEMENT_RULES = """\
+
+CLAIM FIDELITY — never round a claim up. Place a phrase by what it literally
+says, never by a stronger, more specific or more severe version of it.
+ - Do not escalate an outcome or a degree: a fault, an illness or a hazard is
+   not the worst case of its kind unless the customer states that worst case.
+   A phrase reporting that something went wrong belongs with the general
+   problem, NOT with the group named after the extreme outcome.
+ - Do not invent a mechanism, cause, affected part or component the wording
+   does not name. That something went wrong is not evidence of WHICH thing
+   went wrong.
+ - If only a severe or highly specific group exists and the phrase is
+   general, create the missing general group instead of forcing the phrase
+   into the severe one.
+
+OPPOSITE CLAIMS NEVER SHARE A GROUP. Two phrases asserting opposite
+directions of the SAME attribute — too much of it vs too little, present vs
+absent, works vs fails — are two different themes even when they use the same
+nouns. Judge the DIRECTION of the claim, not the shared vocabulary. A group
+whose name states one direction must never hold a row stating the other; when
+the opposite theme has no group yet, create it.
+"""
+
 
 def _category_notes(dom: _domain.Domain | None = None) -> str:
     """Per-category guidance appended to the judge prompts, generated from
@@ -214,8 +251,8 @@ def _judge_examples_block(dom: _domain.Domain | None = None) -> str:
 
 
 def build_grouping_system(dom: _domain.Domain | None = None) -> str:
-    return (_GROUPING_BASE + "\n" + _category_notes(dom) + "\n"
-            + _judge_examples_block(dom))
+    return (_GROUPING_BASE + _PLACEMENT_RULES + "\n" + _category_notes(dom)
+            + "\n" + _judge_examples_block(dom))
 
 GROUPING_SCHEMA = {
     "type": "object",
@@ -378,6 +415,49 @@ def _add_unique(canon, b: dict) -> None:
                   b["review_ids"].get(product), b.get("pairs", {}).get(product))
 
 
+def _group_named(tax: Taxonomy, category: str, name: str):
+    """The group of `category` already carrying `name`, or None.
+
+    Every path that creates a group BY NAME must consult this first — two
+    groups with one name in one category render as two separate blocks under
+    the same label in the workbook, which is never what was meant. Compared
+    with fold_label, not normalize: a group name is a THEME label, and two
+    themes differing only in grammatical number ("Chinchilla" /
+    "Chinchillas", "Bigger amount" / "Bigger amounts") are one theme. The
+    rows inside keep their own exact wording either way."""
+    n = fold_label(name)
+    return next((g for g in tax.groups_for(category)
+                 if fold_label(g.name) == n), None)
+
+
+# A judge-proposed group name longer than this is treated as a pasted quote
+# rather than a theme label. The prompt asks for 2-5 words; the cap leaves
+# slack for hyphenation and short connectives.
+_MAX_GROUP_NAME_WORDS = 6
+
+
+def _group_name_for(category: str, b: dict, proposed: str) -> str:
+    """Name for a group being created for phrase bucket `b`.
+
+    For a category named from the extracted `gist` label (domain.yaml
+    name_from: gist — the improvement wishes), the SHORT label wins over a
+    long judge-proposed name. Models routinely echo the raw customer sentence
+    back as new_group_name, and because `proposed` used to win outright every
+    wish became its own group named by a verbatim quote — leaving the
+    consolidation pass nothing to match themes on (measured on the Hamster
+    Sand workbook 2026-08-17: 12 improvement groups, 8 named by a full quote,
+    two pairs of them the same wish). A proposed name that is already short is
+    still preferred: it is the pass that sees the whole taxonomy, so it can
+    reuse a theme label that exists. Falls back to the phrase text when
+    neither is usable; categories not named from a gist are unaffected."""
+    gist = (b.get("gist") or "").strip()
+    if gist and _domain.active().name_from(category) == "gist":
+        if proposed and len(proposed.split()) <= _MAX_GROUP_NAME_WORDS:
+            return proposed
+        return gist
+    return proposed or b["text"]
+
+
 def _deterministic_prepass(tax: Taxonomy, category: str, uniques: list[dict],
                            audit: list | None = None) -> list[dict]:
     """Free placements before any judge call. Exact normalized matches go
@@ -389,6 +469,7 @@ def _deterministic_prepass(tax: Taxonomy, category: str, uniques: list[dict],
     so only the exact pass applies there."""
     by_text = _exact_map(tax, category)
     gate_applies = _domain.active().gated(category)
+    use_gist = _domain.active().name_from(category) == "gist"
     items = [(c.id, c.text) for g in tax.groups_for(category)
              for c in g.canonicals(tax)] if gate_applies else []
     pending = []
@@ -409,6 +490,23 @@ def _deterministic_prepass(tax: Taxonomy, category: str, uniques: list[dict],
                               "phrase": b["text"], "into": target.text,
                               "group": g.name if g else "?"})
             continue
+        # a wish whose gist names a theme that ALREADY exists goes straight
+        # into that group — its own row, no judge call. This is what makes
+        # `gist` the clustering key of a name_from: gist category instead of
+        # a naming hint the judge is free to ignore; without it every wish
+        # was judged on its sentence alone and became its own group
+        # (Hamster Sand 2026-08-17: 12 improvement groups for 5 real themes).
+        # The row keeps the customer's verbatim wording — only the GROUP is
+        # decided by the gist.
+        if use_gist and b.get("gist"):
+            g = _group_named(tax, category, b["gist"])
+            if g is not None:
+                _add_unique(tax.new_canonical(b["text"], g.id), b)
+                if audit is not None:
+                    audit.append({"type": "gist_match", "category": category,
+                                  "phrase": b["text"], "into": b["gist"],
+                                  "group": g.name})
+                continue
         pending.append(b)
     return pending
 
@@ -680,7 +778,9 @@ def _fallback_place(tax: Taxonomy, category: str, b: dict,
     if cands:
         group = tax.groups[tax.canonicals[cands[0][0]].group_id]
     else:
-        group = tax.new_group(category, b["text"])
+        name = _group_name_for(category, b, "")
+        group = _group_named(tax, category, name) or tax.new_group(category,
+                                                                   name)
     canon = tax.new_canonical(b["text"], group.id)
     _add_unique(canon, b)
     if audit is not None:
@@ -1028,7 +1128,7 @@ async def consolidate_taxonomy_async(tax: Taxonomy, llm: LLM,
     async def call(category: str) -> dict:
         nonlocal n_done
         result = await llm.json_call_async(
-            CONSOLIDATE_SYSTEM + _judge_examples_block(),
+            CONSOLIDATE_SYSTEM + _PLACEMENT_RULES + _judge_examples_block(),
             users[category], CONSOLIDATE_SCHEMA)
         n_done += 1
         if progress:
@@ -1387,7 +1487,13 @@ def _apply_split_result(tax: Taxonomy, category: str, group: Group,
                if i in tax.canonicals and tax.canonicals[i].group_id == group.id]
         if not name or len(cans) < 2 or sum(c.total for c in cans) < 3:
             continue
-        new_g = tax.new_group(category, name)
+        # a split that reuses an existing group's name is a MOVE into that
+        # group, not a second group under the same label; naming the group
+        # being split from is a no-op the rows would silently not survive
+        existing = _group_named(tax, category, name)
+        if existing is not None and existing.id == group.id:
+            continue
+        new_g = existing or tax.new_group(category, name)
         for c in cans:
             c.group_id = new_g.id
             used_ids.add(c.id)
@@ -1456,7 +1562,8 @@ async def split_groups_async(tax: Taxonomy, llm: LLM, progress=None,
         if other_themes_by_cat[cat]:
             lines += ["", "THEMES PRESENT ELSEWHERE IN THIS CORPUS:"]
             lines += [f"  - {t}" for t in other_themes_by_cat[cat]]
-        result = await llm.json_call_async(SPLIT_SYSTEM, "\n".join(lines),
+        result = await llm.json_call_async(SPLIT_SYSTEM + _PLACEMENT_RULES,
+                                           "\n".join(lines),
                                            SPLIT_SCHEMA)
         n_done += 1
         if progress:
@@ -1586,7 +1693,8 @@ async def reassign_phrases_async(phrases: list[ExtractedPhrase],
         # after the first read it back as a ~0.1x prompt-cache hit instead of
         # re-billing the same few-thousand-token context as full-price input
         # on every call. Only the per-phrase list stays in the user message.
-        sys_cat = (f"{REASSIGN_SYSTEM}{_judge_examples_block()}\n"
+        sys_cat = (f"{REASSIGN_SYSTEM}{_PLACEMENT_RULES}"
+                   f"{_judge_examples_block()}\n"
                    f"FINAL TAXONOMY (category {category}):\n"
                    f"{ctx_by_cat[category]}")
         for start in range(0, len(pending), batch_size):
@@ -1719,11 +1827,9 @@ def _apply_assignment(tax: Taxonomy, category: str, b: dict, a: dict,
             if ref is not None:
                 group = tax.groups[ref.group_id]
         if group is None:
-            use_gist = _domain.active().name_from(category) == "gist"
-            name = new_group or (b["gist"] if use_gist and b["gist"] else b["text"])
+            name = _group_name_for(category, b, new_group)
             # reuse a group with the same name if the model retyped it
-            existing = next((g for g in tax.groups_for(category)
-                             if normalize(g.name) == normalize(name)), None)
+            existing = _group_named(tax, category, name)
             if existing is None and not allow_new_group:
                 return None     # reassign pass: caller falls back instead
             group = existing or tax.new_group(category, name, usage_cat)
@@ -1743,9 +1849,8 @@ def _apply_assignment(tax: Taxonomy, category: str, b: dict, a: dict,
     if second_id and second_id in tax.groups:
         second = tax.groups[second_id]
     elif second_new:
-        existing = next((g for g in tax.groups_for(category)
-                         if normalize(g.name) == normalize(second_new)), None)
-        second = existing or tax.new_group(category, second_new)
+        second = (_group_named(tax, category, second_new)
+                  or tax.new_group(category, second_new))
     if second and second.id != canon.group_id:
         twin = next((c for c in second.canonicals(tax)
                      if normalize(c.text) == normalize(canon.text)), None)
@@ -1784,6 +1889,85 @@ def _apply_assignment(tax: Taxonomy, category: str, b: dict, a: dict,
             dst.add(product, count, raw, b["review_ids"].get(product),
                    b.get("pairs", {}).get(product))
     return canon
+
+
+# ---------- deterministic taxonomy repair ----------
+
+def dedupe_group_names(tax: Taxonomy) -> list[str]:
+    """Merge groups of one category that carry the SAME name.
+
+    Two same-named groups in one category are the same theme by definition —
+    the workbook renders them as two separate blocks under one label, each
+    with its own subtotal, which is never what was meant. The placement paths
+    reuse an existing name (see _group_named), but a taxonomy can still reach
+    the sheet with a collision: built before that check existed, edited by
+    hand through the board, or assembled by an override that created a group
+    by name. Measured case: "Litter Box / Potty Use" appearing twice in the
+    Positive sheet of the Hamster Sand workbook (2026-08-17).
+
+    Names are compared with fold_label, so two groups differing only in
+    grammatical number ("Chinchilla" / "Chinchillas") count as the same name
+    — one theme, one group. Deterministic and LLM-free. The strongest group
+    (most votes, id as tie-break) keeps its id and name; the rest are merged
+    into it, and rows carrying the same text are absorbed rather than
+    duplicated (see _relocate_canonical). Safe to run repeatedly; runs on
+    every write path from excel_writer.write_workbook, BEFORE reconcile_votes
+    so the vote counts are rebuilt from the review ids the merge left
+    behind."""
+    actions: list[str] = []
+    for category in _domain.active().ids():
+        by_name: dict[str, list] = defaultdict(list)
+        for g in tax.groups_for(category):
+            by_name[fold_label(g.name)].append(g)
+        for dupes in by_name.values():
+            if len(dupes) < 2:
+                continue
+            dupes.sort(key=lambda g: (-g.total(tax), g.id))
+            keep = dupes[0]
+            for src in dupes[1:]:
+                src_name = src.name
+                if _merge_group_into(tax, src.id, keep.id):
+                    actions.append(f"[{category}] однойменну групу "
+                                   f"«{src_name}» злито в одну")
+    return actions
+
+
+def fold_relation_rows(tax: Taxonomy) -> list[str]:
+    """Merge rows of a RELATION category whose labels differ only in
+    grammatical number ("chinchilla" / "chinchillas", "quail" / "quails").
+
+    A relation row carries a short extractor-written LABEL, not a customer
+    wording, so the merge gate and the row-merge pass skip the whole category
+    (Category.gated is False for key="relation"). That is right — the gate's
+    rules are about praise tiers and qualifiers in verbatim quotes — but it
+    left nobody visiting those rows at all, so number variants of one label
+    sat side by side with separate subtotals (Hamster Sand 2026-08-17: 20
+    rows under "Other Small Pets" for 14 actual species).
+
+    Within one group only: the same label in two groups is a deliberate dual
+    placement. The highest-voted wording survives and names the row; votes
+    are re-derived from the distinct review ids by _merge_canonical_into, so
+    a review present in both rows stays one vote. Deterministic, LLM-free,
+    idempotent."""
+    actions: list[str] = []
+    dom = _domain.active()
+    for category in dom.ids():
+        if dom.gated(category):
+            continue
+        for g in tax.groups_for(category):
+            buckets: dict[str, list] = defaultdict(list)
+            for c in g.canonicals(tax):
+                buckets[fold_label(c.text)].append(c)
+            for cans in buckets.values():
+                if len(cans) < 2:
+                    continue
+                cans.sort(key=lambda c: (-c.total, c.id))
+                keep = cans[0]
+                for other in cans[1:]:
+                    actions.append(f"[{category}] рядок «{other.text}» злито "
+                                   f"в «{keep.text}»")
+                    _merge_canonical_into(tax, keep, other)
+    return actions
 
 
 # ---------- vote reconciliation ----------

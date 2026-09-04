@@ -16,8 +16,8 @@ review-scoring/.calibrate_cache.json
 *.xlsx
 *.csv
 *.tsv
-
-
+*.docx
+*.pdf
 # python
 __pycache__/
 *.pyc

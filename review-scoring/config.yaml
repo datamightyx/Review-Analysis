@@ -1,0 +1,14 @@
+# Параметри пайплайна. Читається app.py (load_config), run.py, calibrate.py.
+# Ключі API тут НЕ зберігаються — вони в .env у корені репозиторію.
+
+# openrouter -> OPENROUTER_API_KEY; anthropic -> ANTHROPIC_API_KEY
+provider: openrouter
+
+# Для OpenRouter модель задається слагом (https://openrouter.ai/models).
+model: anthropic/claude-sonnet-4.5
+
+# extended thinking: low / medium / high
+effort: medium
+
+# скільки LLM-викликів одночасно (спільний семафор на весь прогін)
+max_concurrent_requests: 10

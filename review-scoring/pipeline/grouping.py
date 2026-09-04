@@ -856,6 +856,7 @@ def _merge_canonical_into(tax: Taxonomy, keep, other) -> None:
                 keep.quotes[product].append(q)
     _merge_review_ids(keep, other)
     _merge_quote_sources(keep, other)
+    _merge_translations(keep, other)
     # one review = one vote: a review present in BOTH canonicals was just
     # summed above but deduped in review_ids — re-derive the count from the
     # distinct ids so the shared review is not counted twice
@@ -883,6 +884,11 @@ def _merge_quote_sources(keep, other) -> None:
                     lst.append(rid)
 
 
+def _merge_translations(keep, other) -> None:
+    for q, en in other.translations.items():
+        keep.translations.setdefault(q, en)
+
+
 def _dedupe_canonical_into(tax: Taxonomy, keep, other) -> None:
     """Absorb `other` into `keep` without double-counting. Two canonicals
     with the exact same normalized text inside one category can only exist
@@ -900,6 +906,7 @@ def _dedupe_canonical_into(tax: Taxonomy, keep, other) -> None:
                 keep.quotes[product].append(q)
     _merge_review_ids(keep, other)
     _merge_quote_sources(keep, other)
+    _merge_translations(keep, other)
     del tax.canonicals[other.id]
 
 
@@ -1837,10 +1844,20 @@ def _apply_assignment(tax: Taxonomy, category: str, b: dict, a: dict,
             group.usage_category = usage_cat
         canon = tax.new_canonical(b["text"], group.id)
 
+    # all raw variants in this bucket normalized to the same text, so they
+    # share the one translation the bucket carries (see _unique_phrases).
+    # b.get(), not b[]: callers that build a minimal `b` by hand (tests,
+    # overrides) don't carry a quote_en key at all.
+    quote_en = b.get("quote_en")
+    trans_map = ({b["text"]: quote_en,
+                  **{q: quote_en for raws in b.get("raws", {}).values()
+                     for q in raws}}
+                 if quote_en else None)
+
     for product, count in b["counts"].items():
         raw = "; ".join(b["raws"][product][:3])
         canon.add(product, count, raw, b["review_ids"].get(product),
-                  b.get("pairs", {}).get(product))
+                  b.get("pairs", {}).get(product), trans_map)
 
     # dual placement: duplicate the canonical into the second group
     second_id = (a.get("second_group_id") or "").strip()
@@ -1859,7 +1876,7 @@ def _apply_assignment(tax: Taxonomy, category: str, b: dict, a: dict,
         for product, count in b["counts"].items():
             raw = "; ".join(b["raws"][product][:3])
             twin.add(product, count, raw, b["review_ids"].get(product),
-                     b.get("pairs", {}).get(product))
+                     b.get("pairs", {}).get(product), trans_map)
 
     # dual placement into a specific EXISTING row: a quote naming two benefits
     # that already have their own rows (often in the same group, e.g. "great
@@ -1887,7 +1904,7 @@ def _apply_assignment(tax: Taxonomy, category: str, b: dict, a: dict,
         for product, count in b["counts"].items():
             raw = "; ".join(b["raws"][product][:3])
             dst.add(product, count, raw, b["review_ids"].get(product),
-                   b.get("pairs", {}).get(product))
+                   b.get("pairs", {}).get(product), trans_map)
     return canon
 
 

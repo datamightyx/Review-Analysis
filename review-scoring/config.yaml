@@ -5,11 +5,11 @@
 provider: openrouter
 
 # Для OpenRouter модель задається слагом (https://openrouter.ai/models).
-model: anthropic/claude-sonnet-5
+model: google/gemini-3.8-flash
 
 # Екстракція — механічне виписування цитат дослівно, без міркувань.
 # Sonnet тут не потрібен, haiku дає ту саму дослівність у рази дешевше.
-extract_model: anthropic/claude-haiku-4.5
+extract_model: openai/gpt-5.6-luna
 
 # ---------------------------------------------------------------- effort
 # extended thinking. llm.py шле кожен виклик з max_tokens=32000, а OpenRouter

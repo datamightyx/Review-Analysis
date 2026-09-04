@@ -36,15 +36,15 @@ DEFAULT_MODELS = {
 
 # $ per 1M tokens (input, output). Used to price the direct Anthropic API
 # backend, where the response carries no cost field (unlike OpenRouter,
-# which reports real billed cost in usage.cost). Sonnet 5 price is the
-# intro rate in effect through 2026-08-31 (standard rate is $3/$15).
+# which reports real billed cost in usage.cost). Sonnet 5 is at its standard
+# rate here — the $2/$10 intro rate expired 2026-08-31.
 ANTHROPIC_PRICING = {
     "claude-fable-5": (10.00, 50.00),
     "claude-opus-4-8": (5.00, 25.00),
     "claude-opus-4-7": (5.00, 25.00),
     "claude-opus-4-6": (5.00, 25.00),
     "claude-opus-4-5": (5.00, 25.00),
-    "claude-sonnet-5": (2.00, 10.00),
+    "claude-sonnet-5": (3.00, 15.00),
     "claude-sonnet-4-6": (3.00, 15.00),
     "claude-sonnet-4-5": (3.00, 15.00),
     "claude-haiku-4-5": (1.00, 5.00),

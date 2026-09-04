@@ -35,6 +35,14 @@ CENTER_ALIGN = Alignment(horizontal="center", vertical="center")
 CENTER_WRAP_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
+def _labeled(canon) -> str:
+    """canon.text, plus its English translation after a slash when the
+    quote is non-English (translations: quote text -> gloss, see
+    Canonical.translations / pipeline/extract.py quote_en)."""
+    en = canon.translations.get(canon.text, "")
+    return f"{canon.text}/{en}" if en else canon.text
+
+
 def _set_widths(ws, widths: list[float]) -> None:
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -72,7 +80,7 @@ def _write_two_level_sheet(ws, tax: Taxonomy, category: str,
             band = BAND_FILL if p_idx % 2 == 1 else None
             entries = sorted(per_product[product], key=lambda cv: -cv[1])
             for canon, votes in entries:
-                b = ws.cell(row=row, column=2, value=canon.text)
+                b = ws.cell(row=row, column=2, value=_labeled(canon))
                 b.font = DETAIL_FONT
                 b.alignment = TEXT_ALIGN
                 c = ws.cell(row=row, column=3, value=product)
@@ -131,7 +139,7 @@ def _write_relation_sheet(ws, tax: Taxonomy, categories: list[str],
                                              key=lambda kv: -kv[1]):
                     if not votes:
                         continue
-                    b = ws.cell(row=row, column=2, value=canon.text)
+                    b = ws.cell(row=row, column=2, value=_labeled(canon))
                     b.font = DETAIL_FONT
                     b.alignment = Alignment(wrap_text=True, vertical="center", horizontal="left")
                     c = ws.cell(row=row, column=3, value=product)
@@ -181,7 +189,7 @@ def _write_wish_sheet(ws, tax: Taxonomy, category: str,
                 # the sheet.
                 b = ws.cell(row=row, column=2,
                             value=group.name if row == group_first
-                            else canon.text)
+                            else _labeled(canon))
                 b.font = DETAIL_FONT
                 b.alignment = Alignment(wrap_text=True, vertical="center")
                 c = ws.cell(row=row, column=3, value=sample)

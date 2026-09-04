@@ -75,6 +75,12 @@ class Canonical:
     # with each other — this is the ONLY structure that can answer "which
     # review said THIS exact quote", needed by dual_place overrides.
     quote_sources: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    # exact quote text -> English gloss, carried over from ExtractedPhrase.
+    # quote_en (see extract.py) — flat, not per-product, since the same raw
+    # text means the same translation everywhere it appears. Empty for an
+    # English quote; internal-matching-only original intent is unchanged,
+    # this just also keeps the value around for display.
+    translations: dict[str, str] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
@@ -82,7 +88,8 @@ class Canonical:
 
     def add(self, product: str, count: int, raw: str,
             review_ids: list[str] | None = None,
-            sources: list[tuple[str, str]] | None = None) -> None:
+            sources: list[tuple[str, str]] | None = None,
+            translations: dict[str, str] | None = None) -> None:
         self.votes[product] = self.votes.get(product, 0) + count
         self.quotes.setdefault(product, [])
         if raw not in self.quotes[product]:
@@ -100,6 +107,10 @@ class Canonical:
                 lst = smap.setdefault(q, [])
                 if rid not in lst:
                     lst.append(rid)
+        if translations:
+            for q, en in translations.items():
+                if q and en:
+                    self.translations[q] = en
 
 
 @dataclass

@@ -65,6 +65,13 @@ MODEL_CHOICES = {
         "anthropic/claude-sonnet-5",
         "anthropic/claude-sonnet-4.5",
         "anthropic/claude-haiku-4.5",
+        # ~4x cheaper than Sonnet 5 ($0.75/$3.75 vs $3/$15). All seven of the
+        # pipeline's response schemas were verified against both, strict=true,
+        # accepted as-is — no adapter needed. Note the prompt cache: llm.py
+        # only sends cache_control for "claude" models, so Google runs on
+        # Gemini's own implicit caching instead.
+        "google/gemini-3.8-flash",
+        "google/gemini-3.7-flash",
         "openai/gpt-oss-120b:free",
     ],
 }
@@ -199,6 +206,12 @@ div[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
     font-size: 0.82em;
     opacity: 0.75;
     margin-bottom: 0.1rem;
+}
+.quote-card .quote-translation {
+    font-style: italic;
+    opacity: 0.65;
+    font-size: 0.88em;
+    margin-top: 0.15rem;
 }
 
 /* ---- sidebar pipeline stepper ---- */
@@ -389,17 +402,28 @@ def excel_download(path: Path, key: str) -> None:
 def render_phrase_detail(tax: Taxonomy, c, all_products: list[str]) -> None:
     """Одна канонічна фраза: голоси по товарах + всі сирі цитати,
     які було злито в неї (⭐ = збігається з канонічним формулюванням).
+    Не-англійська цитата — з англійським перекладом під нею (сірим, дрібним),
+    якщо LLM його дав при екстракції (translations, models.py).
     Детальний перегляд по одному товару — на вкладці «Фрази товару»."""
-    st.markdown(f"#### 💬 «{html.escape(c.text)}»")
+    en = c.translations.get(c.text, "")
+    st.markdown(f"#### 💬 «{html.escape(c.text)}»"
+               + (f'  <span style="color:gray;font-weight:normal;font-size:0.8em">'
+                  f'/ {html.escape(en)}</span>' if en else ""),
+               unsafe_allow_html=True)
     used_products = [p for p in all_products if c.votes.get(p, 0)]
     st.caption(" · ".join(f"{p} — **{c.votes.get(p, 0)}**" for p in used_products)
                + f" · разом: **{c.total}**")
     for p in used_products:
         for q in split_quote_variants(c.quotes.get(p, [])):
             mark = " ⭐" if normalize(q) == normalize(c.text) else ""
+            q_en = c.translations.get(q, "")
+            translation_html = (
+                f'<div class="quote-translation">/ {html.escape(q_en)}</div>'
+                if q_en else "")
             st.markdown(
                 f'<div class="quote-card"><div class="quote-product">'
-                f'{html.escape(p)}{mark}</div>{html.escape(q)}</div>',
+                f'{html.escape(p)}{mark}</div>{html.escape(q)}'
+                f'{translation_html}</div>',
                 unsafe_allow_html=True)
 
 

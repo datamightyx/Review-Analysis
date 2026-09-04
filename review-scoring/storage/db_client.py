@@ -82,6 +82,13 @@ CREATE TABLE IF NOT EXISTS quote_sources (
     review_id    TEXT NOT NULL,
     UNIQUE (canonical_id, product, quote, review_id)
 );
+CREATE TABLE IF NOT EXISTS quote_translations (
+    canonical_id TEXT NOT NULL REFERENCES canonical_rows(canonical_id)
+                 ON DELETE CASCADE,
+    quote        TEXT NOT NULL,
+    quote_en     TEXT NOT NULL,
+    UNIQUE (canonical_id, quote)
+);
 CREATE TABLE IF NOT EXISTS llm_cache (
     cache_key     TEXT PRIMARY KEY,
     provider      TEXT NOT NULL DEFAULT '',
@@ -155,6 +162,7 @@ class DB:
         (Excel tie-breaking stays byte-identical)."""
         vote_rows: list[tuple[str, str, str, str]] = []
         source_rows: list[tuple[str, str, str, str]] = []
+        translation_rows: list[tuple[str, str, str]] = []
         for cn in tax.canonicals.values():
             products = list(dict.fromkeys(
                 [*cn.votes, *cn.quotes, *cn.review_ids]))
@@ -170,10 +178,13 @@ class DB:
                 for quote, rids in smap.items():
                     for rid in rids:
                         source_rows.append((cn.id, product, quote, rid))
+            for quote, en in cn.translations.items():
+                translation_rows.append((cn.id, quote, en))
         with self._lock, self._conn:
             c = self._conn
             c.execute("DELETE FROM verbatim_votes")
             c.execute("DELETE FROM quote_sources")
+            c.execute("DELETE FROM quote_translations")
             c.execute("DELETE FROM canonical_rows")
             c.execute("DELETE FROM taxonomy_groups")
             c.execute("INSERT OR REPLACE INTO meta VALUES ('next_id', ?)",
@@ -194,6 +205,10 @@ class DB:
                 "INSERT OR IGNORE INTO quote_sources "
                 "(canonical_id, product, quote, review_id) VALUES (?, ?, ?, ?)",
                 source_rows)
+            c.executemany(
+                "INSERT OR IGNORE INTO quote_translations "
+                "(canonical_id, quote, quote_en) VALUES (?, ?, ?)",
+                translation_rows)
         self.checkpoint()
 
     def load_taxonomy(self) -> Taxonomy:
@@ -249,6 +264,12 @@ class DB:
                 lst = smap.setdefault(quote, [])
                 if rid not in lst:
                     lst.append(rid)
+            for cid, quote, quote_en in c.execute(
+                    "SELECT canonical_id, quote, quote_en "
+                    "FROM quote_translations ORDER BY rowid"):
+                cn = tax.canonicals.get(cid)
+                if cn is not None:
+                    cn.translations[quote] = quote_en
         return tax
 
     def taxonomy_counts(self) -> tuple[int, int]:

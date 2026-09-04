@@ -5,10 +5,41 @@
 provider: openrouter
 
 # Для OpenRouter модель задається слагом (https://openrouter.ai/models).
-model: anthropic/claude-sonnet-4.5
+model: anthropic/claude-sonnet-5
 
-# extended thinking: low / medium / high
-effort: medium
+# Екстракція — механічне виписування цитат дослівно, без міркувань.
+# Sonnet тут не потрібен, haiku дає ту саму дослівність у рази дешевше.
+extract_model: anthropic/claude-haiku-4.5
+
+# ---------------------------------------------------------------- effort
+# extended thinking. llm.py шле кожен виклик з max_tokens=32000, а OpenRouter
+# рахує бюджет мислення як max_tokens * ratio:
+#   minimal 0.1 (3200) | low 0.2 (6400) | medium 0.5 (16000) | high 0.8 (25600)
+# Reasoning тарифікується як output (~$15/1M у Sonnet 5), тому цей коефіцієнт
+# — головний важіль вартості прогону, а не кількість відгуків.
+#
+# `minimal` — значення OpenRouter. Якщо переключите provider на anthropic,
+# поставте тут low: нативний бекенд шле effort у output_config як є.
+effort: low
+extract_effort: minimal      # виписати цитату — думати нічого
+verify_effort: low           # лексичний дедуп нових груп
+reassign_effort: low         # матчинг проти вже готової таксономії
+consolidate_effort: medium   # єдиний крок, де міркування реально потрібні
+
+# ---------------------------------------------------------------- батчі
+# Контекст таксономії вставляється в КОЖЕН батч (grouping.py:642) і кешем не
+# накривається — cache_control стоїть лише на system-промті. Більший батч
+# амортизує цей контекст на більшу кількість фраз.
+extract_batch: 16
+group_batch: 40
+
+# ---------------------------------------------------------------- кроки
+# reassign — другий повний прохід по ВСІХ фразах проти фінальної таксономії
+# (~25% вартості прогону). Вимкнено заради ціни; вмикайте назад першим, якщо
+# якість групування просяде.
+reassign: true
+# double_check — окремий виклик-верифікація на кожен батч з новими групами.
+double_check: false
 
 # скільки LLM-викликів одночасно (спільний семафор на весь прогін)
 max_concurrent_requests: 10
